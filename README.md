@@ -12,13 +12,18 @@ This repo is public and holds no secrets. Do not put real code here. Other tests
 - PR-controlled text (branch names) goes through `env`, never into the script text.
 - Every test writes its evidence to the job summary as JSON.
 
+## Security notes
+
+- The repo is public. Any GitHub user can open a fork PR and start the `pull_request_target` runs without the owner (spec item V8 tests whether approval is asked). Harm is limited to runner minutes and extra check runs here.
+- A fork PR can name any commit of the fork network as its head. The `v14e` run then writes to, and cancels, checks of that name on that commit. This is a lesson for the real design: the cancel step trusts the head SHA it is given.
+
 ## Tests
 
 | File | Spec item | Trigger |
 |------|-----------|---------|
 | [v14e-cross-run-check.yml](.github/workflows/v14e-cross-run-check.yml) | V14(d), (e), (e2), V7, V17 cross-run | `pull_request_target` |
 | [v14-scenarios.yml](.github/workflows/v14-scenarios.yml) | V14(a), (b), (c), (d), (f) | `workflow_dispatch` |
-| [v17-pr-number.yml](.github/workflows/v17-pr-number.yml) | V17 | `pull_request_target` |
+| [v17-pr-number.yml](.github/workflows/v17-pr-number.yml) | V17 (the "needs actions: read" half needs a private repo, not covered) | `pull_request_target` |
 
 `pull_request_target` workflows run from the default branch. Merge them to `main` before you open test PRs.
 

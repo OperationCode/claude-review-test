@@ -8,7 +8,8 @@ name: v17-pr-number
 #   3. GET /repos/{o}/{r}/commits/{head_sha}/pulls
 #   4. GET /repos/{o}/{r}/pulls?head={head_owner}:{head_branch}
 #   5. github.ref (expected: the default branch, no PR number)
-# A second job has no actions scope, to see what the run API call needs.
+# The "fails without actions: read" half of V17 is out of scope here: the run API is
+# public in a public repo. It needs a private repo (see TESTING.md).
 #
 # Never checks out anything. Reads through the REST API only. Branch names reach
 # the shell only through env and --field values.
@@ -99,7 +100,7 @@ jobs:
           if [ "$API_STATUS" = "ok" ]; then
             ev --argjson r "$API_OUT" \
                '{step:"run_api", http:"ok", event:$r.event, path:$r.path, head_sha:$r.head_sha,
-                 head_branch:$r.head_branch, head_repository:$r.head_repository.full_name,
+                 head_repository:$r.head_repository.full_name,
                  pull_requests:($r.pull_requests | map(.number)),
                  referenced_workflows:($r.referenced_workflows // [])}'
           else
@@ -137,38 +138,3 @@ jobs:
           else
             ev --arg st "$API_STATUS" '{step:"run_api_later", http:$st, pull_requests:[]}'
           fi
-
-  without-actions-read:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    # actions is not listed, so it is none for this job.
-    permissions:
-      pull-requests: read
-      contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      RUN_ID: ${{ github.run_id }}
-    steps:
-      - name: Read the run without the actions scope
-        run: |
-          set -euo pipefail
-          err="$(mktemp)"
-          if with_token="$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq '{event, pull_requests:(.pull_requests | map(.number))}' 2>"$err")"; then
-            with_token_status="ok"
-          else
-            with_token_status="$(grep -o 'HTTP [0-9]*' "$err" | head -1 || true)"
-            with_token_status="${with_token_status:-error}"
-            with_token="null"
-          fi
-          anon_code="$(curl -s -o /dev/null -w '%{http_code}' \
-            -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID")"
-          {
-            echo "### V17 run API without actions: read"
-            echo '```json'
-            jq -n --arg s "$with_token_status" --argjson body "$with_token" --arg anon "$anon_code" \
-              '{token_without_actions_scope:{http:$s, body:$body}, no_token_at_all_http:$anon,
-                note:"In a public repo the run API is readable with no token, so a pass here does not prove the scope is needed. Only a private repo can show that."}'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"

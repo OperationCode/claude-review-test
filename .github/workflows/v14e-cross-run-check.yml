@@ -73,7 +73,8 @@ jobs:
                   create_ok: ((map(select(.step=="create")) | first | .ok) // null),
                   own_check_visible: ((map(select(.step=="visibility")) | first | .visible) // null),
                   older_checks_seen: ((map(select(.step=="older_checks")) | first | .count) // null),
-                  ids_increasing_vs_older: ((map(select(.step=="older_checks")) | first | .all_older_ids_lower) // null),
+                  list_reads_needed: ((map(select(.step=="visibility")) | first | .list_reads_needed) // null),
+                  ids_increasing_vs_older: ((map(select(.step=="older_checks")) | first) as $o | if $o == null or $o.count == 0 then null else $o.all_older_ids_lower end),
                   cross_run_writes: [ .[] | select(.step=="write") | {target_id, kind, relation, ok, persisted} ],
                   all_cross_run_writes_persisted: ([ .[] | select(.step=="write" and .kind != "skip_already_cancelled") ] | if length == 0 then null else all(.persisted) end)
                 }
@@ -205,10 +206,12 @@ jobs:
           sleep 10
           call gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
             -f check_name="$CHECK_NAME" -f filter=latest -f per_page=100
-          LATEST="$(jq -c '[.check_runs[] | {id, status, conclusion, external_id}]' <<<"$API_OUT")"
+          LATEST="$(jq -c '[.check_runs[] | {id, status, conclusion, external_id}]' <<<"$API_OUT" 2>/dev/null || true)"
+          LATEST="${LATEST:-[]}"
           call gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
             -f check_name="$CHECK_NAME" -f filter=all -f per_page=100
-          ALL="$(jq -c '[.check_runs[] | {id, status, conclusion, external_id}] | sort_by(.id)' <<<"$API_OUT")"
+          ALL="$(jq -c '[.check_runs[] | {id, status, conclusion, external_id}] | sort_by(.id)' <<<"$API_OUT" 2>/dev/null || true)"
+          ALL="${ALL:-[]}"
           call gh api "repos/$REPO/pulls/$PR_NUMBER" \
             --jq '{mergeable, mergeable_state, base:.base.ref}'
           MERGE_REST="${API_OUT:-null}"

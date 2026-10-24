@@ -86,7 +86,9 @@ jobs:
             id="$(gh api -X POST "repos/$REPO/check-runs" \
               -f name="$CHECK_NAME" -f head_sha="$HEAD_SHA" -f status=in_progress \
               -f external_id="scn:$RUN_ID:$1" \
-              -f "output[title]=scenario $SCENARIO $1" -f "output[summary]=v14 scenario $SCENARIO" --jq .id)"
+              -f "output[title]=scenario $SCENARIO $1" -f "output[summary]=v14 scenario $SCENARIO" --jq .id)" \
+              || { echo "create check '$1' failed" >&2; exit 1; }
+            [[ "$id" =~ ^[0-9]+$ ]] || { echo "create check '$1' returned no ID" >&2; exit 1; }
             echo "$id" >> "$IDS_FILE"  # a file, because create runs in a subshell
             ev --arg l "$1" --argjson id "$id" '{step:"create", label:$l, id:$id}'
             echo "$id"

@@ -13,16 +13,16 @@ Owner:
 
 1. Push the repo to `OperationCode/claude-review-test` on `main`. The `pull_request_target` workflows must exist on `main` before any PR is opened.
 2. Settings, Actions, General, "Workflow permissions": keep the default (read repository contents). The workflows set their own permissions per job.
-3. Settings, Actions, General, "Fork pull request workflows from outside collaborators": choose "Require approval for first-time contributors" (or stricter). You must approve the second account's runs by hand (step 3.2).
+3. Settings, Actions, General, "Fork pull request workflows from outside collaborators": choose "Require approval for first-time contributors" (or stricter). Runs of `pull_request_target` come from the base branch, so they may start with no approval. See step 3.1.
 4. Create `branch-a` with one small change to `README.md` (any text). Do not merge it.
 
 For the merge box tests (part 4) only:
 
-5. Settings, Rules, Rulesets, New branch ruleset: target `main`, enforcement Active, rule "Require status checks to pass", add the check `oc-claude-review-scn` (source: GitHub Actions; if the picker does not list it yet, type the name after the first scenario run). Optional second ruleset requiring `oc-claude-review` for part 1 merge box notes.
+5. Settings, Rules, Rulesets, New branch ruleset: target `main`, enforcement Active, rule "Require status checks to pass", add the check `oc-claude-review-scn` (source: GitHub Actions; if the picker does not list it yet, type the name after the first scenario run). Do not add a ruleset that requires `oc-claude-review`: it would make part 4 read `BLOCKED` for the wrong reason. Create this ruleset only when you start part 4, and disable it after.
 
 ## 1. V14(e) and V17, same-repo PR (owner)
 
-Open the PR first, then run the steps in order. After each step, wait until all workflow runs of that step finish (about 40 s), then read the summaries listed.
+Open the PR first, then run the steps in order. After each step, wait until all workflow runs of that step show a finished state (green or red), do not go by time, then read the summaries listed. The merge state is read a few seconds after the writes and can lag.
 
 Checks belong to one head SHA, so steps 1.1 to 1.4 use head H1 and steps 1.5 and 1.6 use head H2.
 
@@ -31,15 +31,15 @@ Checks belong to one head SHA, so steps 1.1 to 1.4 use head H1 and steps 1.5 and
 | 1.1 | Open a PR `branch-a` to `main`. | H1: c1 `in_progress`. |
 | 1.2 | Close the PR, then reopen it. | c1 `cancelled` (by run 2), c2 `success`. |
 | 1.3 | Close and reopen again. | c2 `cancelled` (by run 3), c3 `success`. |
-| 1.4 | Open the `v14e-cross-run-check` run of step 1.3. Click "Re-run all jobs". | c3 `cancelled` (by attempt 2), c4 `success`. |
+| 1.4 | Open the `v14e-cross-run-check` run of step 1.3 and click "Re-run all jobs". Do the same for the `v17-pr-number` run of step 1.3. | c3 `cancelled` (by attempt 2), c4 `success`. |
 | 1.5 | Push one new commit to `branch-a`. | H2: c5 `in_progress`. H1 is untouched. |
-| 1.6 | Open the `v14e-cross-run-check` run of step 1.5. Click "Re-run all jobs". | c5 `cancelled` (by attempt 2), c6 `in_progress`. |
+| 1.6 | Open the `v14e-cross-run-check` run of step 1.5 and click "Re-run all jobs". Do the same for the `v17-pr-number` run of step 1.5. | c5 `cancelled` (by attempt 2), c6 `in_progress`. |
 | 1.7 | Optional: push two commits within 5 seconds. | Two concurrent runs. V14(e2) race evidence. |
 
 Read, for every step:
 
 - Actions, run `v14e-cross-run-check`, job `cross-run`, job summary. Fields: `verdict`, `evidence`.
-- Actions, run `v17-pr-number`, job `with-actions-read` and `without-actions-read`, job summaries.
+- Actions, run `v17-pr-number`, job `with-actions-read`, job summary.
 
 The four cells of the cross-run matrix:
 
@@ -50,7 +50,7 @@ The four cells of the cross-run matrix:
 
 ## 2. V14 merge box notes (owner, optional on same PR)
 
-On the PR page after steps 1.2 and 1.5, write down what the merge box and the "Checks" tab list show for `oc-claude-review`: how many entries, and which state. Compare with `final_state.pull_graphql` and `filter_latest` in the summary.
+On the PR page after steps 1.2 and 1.5, write down what the merge box and the "Checks" tab list show for `oc-claude-review`: how many entries, and which state. Compare with `final_state.pull_graphql` in the `v14e` summary. The `filter_latest` and `filter_all` lists are API facts only (see part 5).
 
 ## 3. Fork PR (second account)
 
@@ -62,27 +62,30 @@ Steps for the second account:
 
 Owner, after the second account opens the PR:
 
-3.1. Actions tab: the two runs show "Approve and run" or "Waiting". Click "Approve and run" for the fork PR runs. Do not approve a run if the diff touches `.github/`.
+3.1. Actions tab: write down whether the two runs of the fork PR start by themselves or show "Approve and run" or "Waiting". Runs of `pull_request_target` probably start with no prompt. If so, that is evidence for spec item V8: write it down and go on. If a prompt shows, approve it.
 3.2. Read the same summaries as in part 1 (`v14e-cross-run-check`, `v17-pr-number`).
 
-Then repeat on the fork PR (same head rules as part 1):
+Then repeat on the fork PR. The fork PR has its own head SHAs, so the matrix cells fill the same way as in part 1. Wait for all runs to finish between steps.
 
-| Step | Who | Action |
-|------|-----|--------|
-| 3.3 | Owner | Close and reopen the fork PR. Approve the runs if asked. |
-| 3.4 | Owner | Close and reopen again, approve, then "Re-run all jobs" on that run. |
-| 3.5 | Second account | Push a new commit to `fork-branch-a`. Owner approves the runs. |
-| 3.6 | Owner | "Re-run all jobs" on the run of step 3.5. |
+| Step | Who | Action | Expected check state afterwards | Matrix cell |
+|------|-----|--------|---------------------------------|-------------|
+| 3.3 | Owner | Close and reopen the fork PR. | F1: c1 `in_progress` (from 3.2) becomes `cancelled`, c2 `success`. | other-run, in_progress |
+| 3.4 | Owner | Close and reopen again. Wait for the runs. | c2 `cancelled`, c3 `success`. | other-run, completed |
+| 3.5 | Owner | Open the `v14e-cross-run-check` run of step 3.4 and click "Re-run all jobs". Do the same for the `v17-pr-number` run. | c3 `cancelled`, c4 `success`. | rerun, completed |
+| 3.6 | Second account | Push a new commit to `fork-branch-a`. | F2: c5 `in_progress`. | (setup) |
+| 3.7 | Owner | Open the `v14e-cross-run-check` run of step 3.6 and click "Re-run all jobs". Do the same for the `v17-pr-number` run. | c5 `cancelled`, c6 `in_progress`. | rerun, in_progress |
 
-Optional: the second account force-pushes the fork branch, and the owner repeats step 3.6. This checks `pull_requests[]` after a force-push.
+Optional: the second account force-pushes the fork branch, and the owner repeats step 3.7. This checks `pull_requests[]` after a force-push.
 
 ## 4. V14 scenarios on one head SHA (owner)
 
-Needs the ruleset from setup step 5. Use a fresh head SHA per scenario: push an empty commit to `branch-a` (`git commit --allow-empty -m s`), copy the new full head SHA from the PR (Commits tab, copy full SHA).
+Needs the ruleset from setup step 5. Do this on a **separate PR** from a new branch `scn-branch`, not on `branch-a`. Before you open it, disable the workflows `v14e-cross-run-check` and `v17-pr-number` (Actions tab, the workflow, "..." menu, "Disable workflow"). Otherwise each push adds an `oc-claude-review` check and mixes into the reads. Enable them again after part 4.
+
+Use a fresh head SHA per scenario: push an empty commit to `scn-branch` (`git commit --allow-empty -m s`), copy the new full head SHA from the PR (Commits tab, copy full SHA).
 
 For each scenario `a`, `b`, `c`, `f`, `g`: Actions, `v14-scenarios`, "Run workflow", enter `scenario`, `head_sha`, `pr_number`, leave `check_name` as `oc-claude-review-scn`. After the run, read the summary, and look at the PR merge box and the Checks tab. Write down which state the box shows (blocked, ready) and how many entries it lists for the check name.
 
-Also run scenario `a` once on the **fork PR** head SHA (the SHA from the fork PR, as the owner's token creates the checks in the base repo).
+Also run scenario `a` once for the **fork PR**: `pr_number` is the fork PR number and `head_sha` is the current head of the fork branch (copy it from the fork PR, Commits tab). The workflow creates the checks in the base repo with the base repo token. Disable the two other workflows first, as above.
 
 ## 5. How to read results
 
@@ -102,12 +105,12 @@ In the `v14e-cross-run-check` summary, each older check has one `write` entry in
 
 ### V14(d), IDs
 
-- `verdict.ids_increasing_vs_older: true` in v14e, and `v14d_ids_increase_in_creation_order: true` in each scenario run: PASS. Any `false`: FAIL, and "the newest is the highest ID" cannot be used.
+- `verdict.ids_increasing_vs_older: true` in v14e (`null` when there was no older check, as in step 1.1), and `v14d_ids_increase_in_creation_order: true` in each scenario run: PASS. Any `false`: FAIL, and "the newest is the highest ID" cannot be used.
 
 ### V14(e2), list freshness
 
-- `visibility.list_reads_needed: 1` with `visible: true`: the own check shows in the list at once.
-- `older_checks.count` equal to the number of earlier checks, in a quick re-run (steps 1.2, 1.3, 1.4): the check list shows another run's check at once. If an earlier check is missing in `older_checks` (compare with the ID list in the Checks tab or in `final_state.filter_all`): FAIL for "reads at once". The publisher must wait and read again.
+- `verdict.list_reads_needed: 1` (from the `visibility` entry in `evidence`) with `visible: true`: the own check shows in the list at once.
+- The `older_checks` entry in `evidence`, field `count`, equal to the number of earlier checks, in a quick re-run (steps 1.2, 1.3, 1.4): the check list shows another run's check at once. If an earlier check is missing in `older_checks` (compare with the ID list in the Checks tab or in `final_state.filter_all`): FAIL for "reads at once". The publisher must wait and read again.
 - The race in step 1.7 may show one run that does not see the other run's check. Record it. It is not a fail alone.
 
 ### V14(a), (b), (c), (f), (g): which check counts
@@ -122,7 +125,7 @@ For each scenario read `evidence` entries with `step: "snapshot"`, and your note
 | `f` older cancelled, newer success | merge allowed | `mergeStateStatus` is `CLEAN` |
 | `g` same check re-completed `success`, `cancelled`, `success` | the last write wins | the snapshots follow the last conclusion |
 
-Also record `check_list_filter_latest` vs `check_list_filter_all`: `latest` is what GitHub treats as the current check per name. If `latest` always holds the highest ID, the merge box uses ID order. If it holds the most recently completed one, it uses completion time (this decides scenario `c`).
+Only the PR page, `mergeStateStatus` and the GraphQL rollup entry for the name answer the merge box question. The REST check lists (`check_list_filter_latest`, `check_list_filter_all`) are API facts only: the Checks API defines `filter=latest` as the most recent check runs by completion time, so it says nothing about the merge box. Record them, but do not use them as merge box evidence. For scenario `c`, the winner is the state the PR page shows after each snapshot.
 
 A `mergeStateStatus` of `UNKNOWN` or `BEHIND` or `UNSTABLE` is not an answer: wait a minute, read the PR page by eye and note it. The summary reads the state once, 15 seconds after the writes. If the PR page disagrees with the summary, trust the PR page and write it down.
 
@@ -146,12 +149,14 @@ In the `v17-pr-number` summary, see `verdict`:
 Interpretation:
 
 - Same-repo PR, `run_api_pull_requests_populated_at_once: true`, but fork PR `false` or empty: the run API is not reliable for fork PRs (the known case). The code must use `github.event.pull_request.number` in the job that has the event, and `external_id` as `<run_id>:<run_attempt>:<pr_number>` for later reads. PASS for the fallback.
-- Both same-repo and fork PR show `true` in several repeats (opened, reopened, synchronize, re-run): the run API may be used, but keep the fallback unless it holds for every step.
+- Both same-repo and fork PR show `true` in several repeats (opened, reopened, synchronize, and the re-run of `v17-pr-number`): the run API may be used, but keep the fallback unless it holds for every step.
 - `github_ref_has_pr_number: false` is expected: for `pull_request_target`, `github.ref` is the default branch. It is not a source.
 - `v14e` summary, `creator_run_lookup` entries: `run_pull_requests` is what the run API says about the creating run of an older check. `pr_from_external_id` is the PR number carried in the check's `external_id`. If `run_pull_requests` is empty and `pr_from_external_id` is right, the fallback is needed and works.
 - If a source returns an error (`http` not `ok`), write down the code: that source is not usable.
 
-The `without-actions-read` job summary shows if the run API call works without the `actions` scope. In this **public** repo the call also works without any token (`no_token_at_all_http: "200"`), so the result does not prove the scope is needed. To test the scope, repeat the job in a private repo (not part of this plan). A `403` for `token_without_actions_scope` would be a PASS for "scope needed".
+For the design (authenticating another run), the `creator_run_lookup` entries in the `v14e` summary are the main V17 evidence: they show what the run API says about a run that created an older check, for cross-run and re-run cases.
+
+**Out of scope for now:** the V17 half "the run API call fails without `actions: read`". In a public repo the run API is readable with no token, so a public repo cannot show it. It needs a private repo and stays an open item for the spec.
 
 ## 6. What to send back
 
