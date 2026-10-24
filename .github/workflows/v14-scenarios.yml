@@ -77,7 +77,7 @@ jobs:
                 v14d_ids_increase_in_creation_order: ($ids as $i | [range(1; ($i|length))] | all($i[.] > $i[. - 1]))
               }' "$EV"
               echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
           }
           trap write_summary EXIT
 

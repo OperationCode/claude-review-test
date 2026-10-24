@@ -83,7 +83,7 @@ jobs:
                     }
                   }' "$EV"
               echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
           }
           trap write_summary EXIT
 
