@@ -1,0 +1,167 @@
+name: v14-scenarios
+
+# V14(a), (b), (c), (d), (f) and a same-run re-complete baseline: several check
+# runs with one name on one head SHA, and what the PR merge box and the check
+# list show. Manual only. Needs a PR whose head is the given SHA, and a ruleset
+# that requires the check name (see TESTING.md). Evidence goes to the job summary.
+#
+# Uses its own check name (default oc-claude-review-scn) so that it does not mix
+# with the checks of v14e-cross-run-check.
+#
+# Never checks out anything. Reads and writes through the REST API only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "a = older success + newer in_progress; b = older failure + newer success; c = older success completed AFTER newer failure; f = older cancelled + newer success; g = same check re-completed"
+        required: true
+        type: choice
+        options: [a, b, c, f, g]
+      head_sha:
+        description: "Full 40-char head SHA of the PR (use a fresh commit for each scenario)"
+        required: true
+        type: string
+      pr_number:
+        description: "PR number"
+        required: true
+        type: string
+      check_name:
+        description: "Check name; must match the name the ruleset requires"
+        required: false
+        default: oc-claude-review-scn
+        type: string
+
+permissions: {}
+
+jobs:
+  scenario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      pull-requests: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      SCENARIO: ${{ inputs.scenario }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      CHECK_NAME: ${{ inputs.check_name }}
+    steps:
+      - name: Run scenario
+        run: |
+          set -euo pipefail
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "head_sha must be 40 hex chars"; exit 1; }
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "pr_number must be digits"; exit 1; }
+          [[ "$CHECK_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad check_name"; exit 1; }
+
+          EV="$RUNNER_TEMP/ev.jsonl"
+          : > "$EV"
+          OWNER="${REPO%%/*}"
+          NAME="${REPO##*/}"
+          IDS_FILE="$RUNNER_TEMP/ids.txt"
+          : > "$IDS_FILE"
+
+          ev() { jq -nc "$@" >> "$EV"; }
+
+          write_summary() {
+            {
+              echo "### V14 scenario $SCENARIO on $HEAD_SHA (PR $PR_NUMBER, check $CHECK_NAME)"
+              echo '```json'
+              jq -s --argjson ids "$(jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)' "$IDS_FILE")" '{
+                evidence: .,
+                created_ids_in_creation_order: $ids,
+                v14d_ids_increase_in_creation_order: ($ids as $i | [range(1; ($i|length))] | all($i[.] > $i[. - 1]))
+              }' "$EV"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap write_summary EXIT
+
+          create() { # $1 = label; prints the new check run ID
+            local id
+            id="$(gh api -X POST "repos/$REPO/check-runs" \
+              -f name="$CHECK_NAME" -f head_sha="$HEAD_SHA" -f status=in_progress \
+              -f external_id="scn:$RUN_ID:$1" \
+              -f "output[title]=scenario $SCENARIO $1" -f "output[summary]=v14 scenario $SCENARIO" --jq .id)"
+            echo "$id" >> "$IDS_FILE"  # a file, because create runs in a subshell
+            ev --arg l "$1" --argjson id "$id" '{step:"create", label:$l, id:$id}'
+            echo "$id"
+          }
+
+          finish() { # $1 = id, $2 = conclusion, $3 = label
+            gh api -X PATCH "repos/$REPO/check-runs/$1" \
+              -f status=completed -f conclusion="$2" \
+              -f "output[title]=$2" -f "output[summary]=v14 scenario $SCENARIO $3" >/dev/null
+            ev --argjson id "$1" --arg c "$2" --arg l "$3" '{step:"complete", id:$id, conclusion:$c, label:$l}'
+          }
+
+          snapshot() { # $1 = label
+            sleep 15
+            local latest all rest gql
+            latest="$(gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" -f check_name="$CHECK_NAME" -f filter=latest -f per_page=100 \
+              --jq '[.check_runs[] | {id, status, conclusion}]')"
+            all="$(gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" -f check_name="$CHECK_NAME" -f filter=all -f per_page=100 \
+              --jq '[.check_runs[] | {id, status, conclusion}] | sort_by(.id)')"
+            rest="$(gh api "repos/$REPO/pulls/$PR_NUMBER" \
+              --jq '{mergeable, mergeable_state, pr_head_sha:.head.sha, pr_head_matches_input:(.head.sha == env.HEAD_SHA)}')"
+            gql="$(gh api graphql -F n="$PR_NUMBER" -f o="$OWNER" -f r="$NAME" -f query='
+              query($o:String!, $r:String!, $n:Int!) {
+                repository(owner:$o, name:$r) {
+                  pullRequest(number:$n) {
+                    mergeStateStatus
+                    commits(last:1) { nodes { commit { oid statusCheckRollup {
+                      state
+                      contexts(first:100) { nodes {
+                        __typename
+                        ... on CheckRun { databaseId name status conclusion isRequired(pullRequestNumber:$n) }
+                      } }
+                    } } } }
+                  }
+                }
+              }' | jq -c --arg n "$CHECK_NAME" '.data.repository.pullRequest | {
+                mergeStateStatus,
+                rollup_state:.commits.nodes[0].commit.statusCheckRollup.state,
+                rollup_checks_with_name:[.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[] | select(.name == $n)]}')"
+            ev --arg l "$1" --argjson latest "$latest" --argjson all "$all" --argjson rest "$rest" --argjson gql "$gql" \
+               '{step:"snapshot", label:$l, check_list_filter_latest:$latest, check_list_filter_all:$all, pull_rest:$rest, pull_graphql:$gql}'
+          }
+
+          case "$SCENARIO" in
+            a)
+              A="$(create older)"; finish "$A" success older
+              B="$(create newer)"
+              snapshot "older success, newer in_progress"
+              ;;
+            b)
+              A="$(create older)"; finish "$A" failure older
+              B="$(create newer)"; finish "$B" success newer
+              snapshot "older failure, newer success"
+              ;;
+            c)
+              X="$(create older)"
+              Y="$(create newer)"
+              finish "$Y" failure newer
+              snapshot "older in_progress, newer failure"
+              finish "$X" success older-late
+              snapshot "older success completed after newer failure"
+              ;;
+            f)
+              A="$(create older)"; finish "$A" cancelled older
+              B="$(create newer)"; finish "$B" success newer
+              snapshot "older cancelled, newer success"
+              ;;
+            g)
+              A="$(create only)"; finish "$A" success first
+              finish "$A" cancelled second
+              snapshot "success re-completed as cancelled"
+              finish "$A" success third
+              snapshot "cancelled re-completed as success"
+              ;;
+            *)
+              echo "unknown scenario"; exit 1
+              ;;
+          esac

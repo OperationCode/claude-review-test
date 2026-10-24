@@ -1,0 +1,174 @@
+name: v17-pr-number
+
+# V17: in a pull_request_target run, where can the code get the PR number?
+# Sources compared (every one is recorded next to the event payload value):
+#   1. github.event.pull_request.number and github.event.number (event payload)
+#   2. GET /repos/{o}/{r}/actions/runs/{run_id}  field pull_requests[]
+#      (read at once, again after 15 s, and via the attempts endpoint)
+#   3. GET /repos/{o}/{r}/commits/{head_sha}/pulls
+#   4. GET /repos/{o}/{r}/pulls?head={head_owner}:{head_branch}
+#   5. github.ref (expected: the default branch, no PR number)
+# A second job has no actions scope, to see what the run API call needs.
+#
+# Never checks out anything. Reads through the REST API only. Branch names reach
+# the shell only through env and --field values.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  with-actions-read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      pull-requests: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      GITHUB_REF_VALUE: ${{ github.ref }}
+      EVENT_ACTION: ${{ github.event.action }}
+      EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+      EVENT_NUMBER: ${{ github.event.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
+    steps:
+      - name: Compare PR number sources
+        run: |
+          set -euo pipefail
+          EV="$RUNNER_TEMP/ev.jsonl"
+          : > "$EV"
+          API_OUT=""
+          API_STATUS=""
+
+          ev() { jq -nc "$@" >> "$EV"; }
+
+          call() {
+            local err
+            err="$(mktemp)"
+            if API_OUT="$("$@" 2>"$err")"; then
+              API_STATUS="ok"
+            else
+              API_STATUS="$(grep -o 'HTTP [0-9]*' "$err" | head -1 || true)"
+              API_STATUS="${API_STATUS:-error}"
+            fi
+            rm -f "$err"
+          }
+
+          write_summary() {
+            {
+              echo "### V17 PR number sources (with actions: read)"
+              echo '```json'
+              jq -s --arg want "$EVENT_PR_NUMBER" '
+                . as $all
+                | {
+                    evidence: $all,
+                    verdict: {
+                      event_number: $want,
+                      fork: ((map(select(.step=="context")) | first | .fork) // null),
+                      run_api_pull_requests_populated_at_once: ((map(select(.step=="run_api")) | first | .pull_requests | length > 0) // null),
+                      run_api_pull_requests_populated_after_15s: ((map(select(.step=="run_api_later")) | first | .pull_requests | length > 0) // null),
+                      run_api_matches_event: ((map(select(.step=="run_api")) | first | .pull_requests | map(tostring) | index($want) != null) // null),
+                      commit_pulls_matches_event: ((map(select(.step=="commit_pulls")) | first | .numbers | map(tostring) | index($want) != null) // null),
+                      head_query_matches_event: ((map(select(.step=="head_query")) | first | .numbers | map(tostring) | index($want) != null) // null)
+                    }
+                  }' "$EV"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap write_summary EXIT
+
+          ev --arg act "$EVENT_ACTION" --arg a "$EVENT_PR_NUMBER" --arg b "$EVENT_NUMBER" \
+             --arg ref "$GITHUB_REF_VALUE" --arg hr "$HEAD_REPO" --arg repo "$REPO" \
+             --arg payload "$(jq -r '.pull_request.number // ""' "$GITHUB_EVENT_PATH")" \
+             '{step:"context", action:$act, event_pull_request_number:$a, event_number:$b,
+               payload_file_pull_request_number:$payload, github_ref:$ref,
+               github_ref_has_pr_number:($ref | test("^refs/pull/")),
+               head_repo:$hr, fork:($hr != $repo)}'
+
+          # Source 2: the run API.
+          call gh api "repos/$REPO/actions/runs/$RUN_ID"
+          if [ "$API_STATUS" = "ok" ]; then
+            ev --argjson r "$API_OUT" \
+               '{step:"run_api", http:"ok", event:$r.event, path:$r.path, head_sha:$r.head_sha,
+                 head_branch:$r.head_branch, head_repository:$r.head_repository.full_name,
+                 pull_requests:($r.pull_requests | map(.number)),
+                 referenced_workflows:($r.referenced_workflows // [])}'
+          else
+            ev --arg st "$API_STATUS" '{step:"run_api", http:$st, pull_requests:[]}'
+          fi
+
+          call gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT"
+          if [ "$API_STATUS" = "ok" ]; then
+            ev --argjson r "$API_OUT" '{step:"run_attempt_api", http:"ok", pull_requests:($r.pull_requests | map(.number))}'
+          else
+            ev --arg st "$API_STATUS" '{step:"run_attempt_api", http:$st, pull_requests:[]}'
+          fi
+
+          # Source 3: PRs that contain the head commit.
+          call gh api "repos/$REPO/commits/$HEAD_SHA/pulls"
+          if [ "$API_STATUS" = "ok" ]; then
+            ev --argjson r "$API_OUT" '{step:"commit_pulls", http:"ok", numbers:($r | map(.number))}'
+          else
+            ev --arg st "$API_STATUS" '{step:"commit_pulls", http:$st, numbers:[]}'
+          fi
+
+          # Source 4: PRs by head owner and branch.
+          call gh api -X GET "repos/$REPO/pulls" -f state=all -f head="$HEAD_OWNER:$HEAD_REF" -f per_page=100
+          if [ "$API_STATUS" = "ok" ]; then
+            ev --argjson r "$API_OUT" '{step:"head_query", http:"ok", numbers:($r | map(.number))}'
+          else
+            ev --arg st "$API_STATUS" '{step:"head_query", http:$st, numbers:[]}'
+          fi
+
+          # Source 2 again, later: is pull_requests filled in after a delay?
+          sleep 15
+          call gh api "repos/$REPO/actions/runs/$RUN_ID"
+          if [ "$API_STATUS" = "ok" ]; then
+            ev --argjson r "$API_OUT" '{step:"run_api_later", http:"ok", pull_requests:($r.pull_requests | map(.number))}'
+          else
+            ev --arg st "$API_STATUS" '{step:"run_api_later", http:$st, pull_requests:[]}'
+          fi
+
+  without-actions-read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # actions is not listed, so it is none for this job.
+    permissions:
+      pull-requests: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Read the run without the actions scope
+        run: |
+          set -euo pipefail
+          err="$(mktemp)"
+          if with_token="$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq '{event, pull_requests:(.pull_requests | map(.number))}' 2>"$err")"; then
+            with_token_status="ok"
+          else
+            with_token_status="$(grep -o 'HTTP [0-9]*' "$err" | head -1 || true)"
+            with_token_status="${with_token_status:-error}"
+            with_token="null"
+          fi
+          anon_code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID")"
+          {
+            echo "### V17 run API without actions: read"
+            echo '```json'
+            jq -n --arg s "$with_token_status" --argjson body "$with_token" --arg anon "$anon_code" \
+              '{token_without_actions_scope:{http:$s, body:$body}, no_token_at_all_http:$anon,
+                note:"In a public repo the run API is readable with no token, so a pass here does not prove the scope is needed. Only a private repo can show that."}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

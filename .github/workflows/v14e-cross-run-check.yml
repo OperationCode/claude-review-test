@@ -1,0 +1,239 @@
+name: v14e-cross-run-check
+
+# V14(e), V14(d), V14(e2), V7 and the cross-run part of V17.
+# Each run creates a check run named oc-claude-review on the PR head SHA, then
+# tries to complete or re-complete every OLDER check of that name, which a
+# DIFFERENT run (or an earlier attempt of this run) created. Evidence goes to
+# the job summary as JSON. See TESTING.md.
+#
+# Never checks out anything. Reads and writes through the REST API only.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  cross-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      actions: read
+      pull-requests: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      EVENT_ACTION: ${{ github.event.action }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      CHECK_NAME: oc-claude-review
+    steps:
+      - name: Cross-run check lifecycle
+        run: |
+          set -euo pipefail
+          EV="$RUNNER_TEMP/ev.jsonl"
+          : > "$EV"
+          OWNER="${REPO%%/*}"
+          NAME="${REPO##*/}"
+          API_OUT=""
+          API_STATUS=""
+          API_ERR=""
+
+          ev() { jq -nc "$@" >> "$EV"; }
+
+          # Run a gh command. Sets API_OUT, API_STATUS (ok | HTTP nnn | error), API_ERR.
+          call() {
+            local err
+            err="$(mktemp)"
+            API_ERR=""
+            if API_OUT="$("$@" 2>"$err")"; then
+              API_STATUS="ok"
+            else
+              API_STATUS="$(grep -o 'HTTP [0-9]*' "$err" | head -1 || true)"
+              API_STATUS="${API_STATUS:-error}"
+              API_ERR="$(head -c 300 "$err")"
+            fi
+            rm -f "$err"
+          }
+
+          write_summary() {
+            {
+              echo "### V14(e) cross-run check lifecycle"
+              echo '```json'
+              jq -s '{
+                evidence: .,
+                verdict: {
+                  create_ok: ((map(select(.step=="create")) | first | .ok) // null),
+                  own_check_visible: ((map(select(.step=="visibility")) | first | .visible) // null),
+                  older_checks_seen: ((map(select(.step=="older_checks")) | first | .count) // null),
+                  ids_increasing_vs_older: ((map(select(.step=="older_checks")) | first | .all_older_ids_lower) // null),
+                  cross_run_writes: [ .[] | select(.step=="write") | {target_id, kind, relation, ok, persisted} ],
+                  all_cross_run_writes_persisted: ([ .[] | select(.step=="write" and .kind != "skip_already_cancelled") ] | if length == 0 then null else all(.persisted) end)
+                }
+              }' "$EV"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap write_summary EXIT
+
+          ev --arg run "$RUN_ID" --arg att "$RUN_ATTEMPT" --arg act "$EVENT_ACTION" \
+             --arg pr "$PR_NUMBER" --arg head "$HEAD_SHA" --arg wsha "$WORKFLOW_SHA" \
+             --arg hr "$HEAD_REPO" --arg repo "$REPO" \
+             '{step:"context", run_id:$run, run_attempt:$att, action:$act, pr:$pr,
+               head_sha:$head, github_sha_is_not_head:($wsha != $head),
+               head_repo:$hr, fork:($hr != $repo)}'
+
+          # Create the own check on the PR head SHA. The external_id carries the
+          # PR number, as the spec fallback does.
+          call gh api -X POST "repos/$REPO/check-runs" \
+            -f name="$CHECK_NAME" -f head_sha="$HEAD_SHA" -f status=in_progress \
+            -f external_id="$RUN_ID:$RUN_ATTEMPT:$PR_NUMBER" \
+            -f "output[title]=v14e run $RUN_ID attempt $RUN_ATTEMPT" \
+            -f "output[summary]=created by $EVENT_ACTION"
+          ev --arg st "$API_STATUS" --arg err "$API_ERR" \
+             '{step:"create", ok:($st=="ok"), status:$st, error:$err}'
+          [ "$API_STATUS" = "ok" ] || exit 1
+          MY_ID="$(jq -r .id <<<"$API_OUT")"
+
+          # V14(e2): how long until the own check shows in the check list.
+          visible=false
+          tries=0
+          for i in $(seq 1 15); do
+            tries="$i"
+            call gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+              -f check_name="$CHECK_NAME" -f filter=all -f per_page=100
+            if jq -e --argjson me "$MY_ID" '.check_runs | any(.id == $me)' <<<"$API_OUT" >/dev/null; then
+              visible=true
+              break
+            fi
+            sleep 1
+          done
+          ev --argjson id "$MY_ID" --argjson v "$visible" --argjson t "$tries" \
+             '{step:"visibility", my_id:$id, visible:$v, list_reads_needed:$t}'
+
+          # Older checks of the same name on this head (any creator).
+          OLDER="$(jq -c --argjson me "$MY_ID" \
+            '[.check_runs[] | select(.id != $me)
+              | {id, status, conclusion, external_id, app:.app.slug, started_at}] | sort_by(.id)' <<<"$API_OUT")"
+          ev --argjson o "$OLDER" --argjson me "$MY_ID" \
+             '{step:"older_checks", my_id:$me, count:($o|length),
+               all_older_ids_lower:($o | all(.id < $me)), older:$o}'
+
+          while read -r row; do
+            id="$(jq -r .id <<<"$row")"
+            st="$(jq -r .status <<<"$row")"
+            con="$(jq -r '.conclusion // ""' <<<"$row")"
+            ext="$(jq -r '.external_id // ""' <<<"$row")"
+            IFS=: read -r e_run e_att e_pr <<<"$ext" || true
+            e_run="${e_run:-}"; e_att="${e_att:-}"; e_pr="${e_pr:-}"
+
+            relation="unknown-creator"
+            if [[ "$e_run" =~ ^[0-9]+$ ]]; then
+              if [ "$e_run" = "$RUN_ID" ] && [ "$e_att" = "$RUN_ATTEMPT" ]; then
+                relation="same-attempt"
+              elif [ "$e_run" = "$RUN_ID" ]; then
+                relation="rerun-same-run-id"
+              else
+                relation="other-run"
+              fi
+              # V17 cross-run: what the run API says about the creating run.
+              call gh api "repos/$REPO/actions/runs/$e_run"
+              if [ "$API_STATUS" = "ok" ]; then
+                ev --argjson id "$id" --arg rel "$relation" --arg epr "$e_pr" --argjson run "$API_OUT" \
+                   '{step:"creator_run_lookup", check_id:$id, relation:$rel,
+                     run_event:$run.event, run_path:$run.path,
+                     run_pull_requests:($run.pull_requests | map(.number)),
+                     run_referenced_workflows:(($run.referenced_workflows // []) | length),
+                     pr_from_external_id:$epr}'
+              else
+                ev --argjson id "$id" --arg st "$API_STATUS" '{step:"creator_run_lookup", check_id:$id, ok:false, status:$st}'
+              fi
+            fi
+
+            if [ "$st" != "completed" ]; then
+              kind="complete_in_progress"
+            elif [ "$con" != "cancelled" ]; then
+              kind="recomplete_completed"
+            else
+              kind="skip_already_cancelled"
+            fi
+
+            if [ "$kind" = "skip_already_cancelled" ]; then
+              ev --argjson id "$id" --arg k "$kind" --arg rel "$relation" \
+                 '{step:"write", target_id:$id, kind:$k, relation:$rel, ok:true, persisted:true}'
+              continue
+            fi
+
+            call gh api -X PATCH "repos/$REPO/check-runs/$id" \
+              -f status=completed -f conclusion=cancelled \
+              -f "output[title]=superseded by $MY_ID" \
+              -f "output[summary]=v14e write from run $RUN_ID attempt $RUN_ATTEMPT ($kind)"
+            w_status="$API_STATUS"
+            w_err="$API_ERR"
+            call gh api "repos/$REPO/check-runs/$id"
+            ev --argjson id "$id" --arg k "$kind" --arg rel "$relation" --arg ws "$w_status" \
+               --arg we "$w_err" --arg before_st "$st" --arg before_con "$con" --arg rs "$API_STATUS" \
+               --arg a_st "$(jq -r '.status // ""' <<<"$API_OUT")" \
+               --arg a_con "$(jq -r '.conclusion // ""' <<<"$API_OUT")" \
+               '{step:"write", target_id:$id, kind:$k, relation:$rel, ok:($ws=="ok"), http:$ws, error:$we,
+                 before:{status:$before_st, conclusion:$before_con},
+                 after:{status:$a_st, conclusion:$a_con},
+                 persisted:($a_st=="completed" and $a_con=="cancelled")}'
+          done < <(jq -c '.[]' <<<"$OLDER")
+
+          # Own check: leave it in_progress on opened and synchronize, so the
+          # next run must complete an in_progress check. Complete it as
+          # success on reopened, so the next run must re-complete a completed one.
+          if [ "$EVENT_ACTION" = "reopened" ]; then
+            call gh api -X PATCH "repos/$REPO/check-runs/$MY_ID" \
+              -f status=completed -f conclusion=success \
+              -f "output[title]=v14e success" -f "output[summary]=own check completed"
+            ev --arg st "$API_STATUS" '{step:"own_check", left:"success", ok:($st=="ok")}'
+          else
+            ev '{step:"own_check", left:"in_progress"}'
+          fi
+
+          # Read what GitHub reports after the writes: check list (latest and all)
+          # and the PR merge box fields.
+          sleep 10
+          call gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            -f check_name="$CHECK_NAME" -f filter=latest -f per_page=100
+          LATEST="$(jq -c '[.check_runs[] | {id, status, conclusion, external_id}]' <<<"$API_OUT")"
+          call gh api -X GET "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+            -f check_name="$CHECK_NAME" -f filter=all -f per_page=100
+          ALL="$(jq -c '[.check_runs[] | {id, status, conclusion, external_id}] | sort_by(.id)' <<<"$API_OUT")"
+          call gh api "repos/$REPO/pulls/$PR_NUMBER" \
+            --jq '{mergeable, mergeable_state, base:.base.ref}'
+          MERGE_REST="${API_OUT:-null}"
+          call gh api graphql -F n="$PR_NUMBER" -f o="$OWNER" -f r="$NAME" -f query='
+            query($o:String!, $r:String!, $n:Int!) {
+              repository(owner:$o, name:$r) {
+                pullRequest(number:$n) {
+                  mergeStateStatus
+                  commits(last:1) { nodes { commit { oid statusCheckRollup {
+                    state
+                    contexts(first:100) { nodes {
+                      __typename
+                      ... on CheckRun { databaseId name status conclusion isRequired(pullRequestNumber:$n) }
+                    } }
+                  } } } }
+                }
+              }
+            }'
+          ROLLUP="null"
+          if [ "$API_STATUS" = "ok" ]; then
+            ROLLUP="$(jq -c --arg n "$CHECK_NAME" '.data.repository.pullRequest | {
+              mergeStateStatus,
+              rollup_state:.commits.nodes[0].commit.statusCheckRollup.state,
+              rollup_checks_with_name:[.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]
+                | select(.name == $n)]}' <<<"$API_OUT")"
+          fi
+          ev --argjson latest "$LATEST" --argjson all "$ALL" --argjson rest "$MERGE_REST" --argjson gql "$ROLLUP" \
+             '{step:"final_state", filter_latest:$latest, filter_all:$all, pull_rest:$rest, pull_graphql:$gql}'
