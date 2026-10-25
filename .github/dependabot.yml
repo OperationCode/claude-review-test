@@ -1,0 +1,14 @@
+# V4 staging file. Inactive here. To start the test, copy it to .github/dependabot.yml
+# on main AFTER the test org ruleset is active (a required workflow does not start on
+# PRs that were already open when the rule was created). Dependabot then opens one PR
+# that bumps is-number 6.0.0 -> 7.x in test-fixtures/p0/v4.
+# target-branch p0-base: the PR targets the branch the test org ruleset covers, so the
+# repo ruleset require-scn (main only) does not block its merge box.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /test-fixtures/p0/v4
+    target-branch: p0-base
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 1
