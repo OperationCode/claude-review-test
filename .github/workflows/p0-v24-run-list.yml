@@ -1,0 +1,83 @@
+name: p0-v24-run-list
+
+# V24: with actions: read, the job's GITHUB_TOKEN lists workflow runs by head SHA
+# (GET /repos/{owner}/{repo}/actions/runs?head_sha=...) and sees each run's path.
+# The job polls the list for a set time and logs, for each run id, the first time it
+# shows up and its created_at, so the list delay can be read off. Start new runs on the
+# same head while it polls (close and reopen the PR, push, re-run).
+# Ruleset-started runs: the scratch gate (p0-required.yml) logs the same data while it
+# pauses. Fork and same-repo PRs: run on one of each.
+#
+# Triggers:
+#   pull_request_target  head branch starts with p0-v24 (fork and same-repo PRs)
+#   pull_request         same-repo p0- or phase0- branches (runs before this file is merged)
+#   workflow_dispatch    any head SHA (for example a V6 PR head)
+#
+# No checkout, no third-party actions, no secrets, no PR text in scripts.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  pull_request:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: "Head SHA to watch (40 hex)"
+        required: true
+      minutes:
+        description: "How long to poll (1-20)"
+        required: false
+        default: "6"
+
+permissions: {}
+
+jobs:
+  run-list:
+    name: run-list
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' && startsWith(github.event.pull_request.head.ref, 'p0-v24')) ||
+      (github.event_name == 'pull_request' &&
+       (startsWith(github.event.pull_request.head.ref, 'p0-') || startsWith(github.event.pull_request.head.ref, 'phase0-')) &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+      HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      INPUT_HEAD: ${{ inputs.head_sha }}
+      MINUTES: ${{ inputs.minutes || '6' }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Poll the run list by head SHA
+        run: |
+          set -uo pipefail
+          head="$EVENT_HEAD"
+          [ "$EVENT_NAME" = "workflow_dispatch" ] && head="$INPUT_HEAD"
+          [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "bad head sha"; exit 1; }
+          [[ "$MINUTES" =~ ^[0-9]{1,2}$ ]] && [ "$MINUTES" -ge 1 ] && [ "$MINUTES" -le 20 ] || MINUTES=6
+          {
+            echo "### V24 run list for head $head (event $EVENT_NAME, head repo ${HEAD_REPO:-n/a}, own run $RUN_ID)"
+            echo "first_seen - created_at = list delay (upper bound; poll every 3 s)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          seen='[]'; errors=0
+          end=$(( $(date +%s) + MINUTES * 60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            t=$(date -u +%FT%TZ)
+            if ! cur=$(gh api "repos/$REPO/actions/runs?head_sha=$head&per_page=100" --jq '[.workflow_runs[] | {id, run_attempt, name, path, event, workflow_id, status, conclusion, created_at}]' 2>&1); then
+              errors=$((errors+1)); echo "$t list error: $cur" | tee -a "$GITHUB_STEP_SUMMARY"; sleep 3; continue
+            fi
+            jq -c --argjson seen "$seen" --arg t "$t" '.[] | select(.id as $i | $seen | index($i) | not)
+              | {first_seen:$t, delay_s:(($t | fromdateiso8601) - (.created_at | fromdateiso8601))} + .' <<<"$cur" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            seen=$(jq -c --argjson seen "$seen" '$seen + [.[].id] | unique' <<<"$cur")
+            sleep 3
+          done
+          { echo "list errors: $errors"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"

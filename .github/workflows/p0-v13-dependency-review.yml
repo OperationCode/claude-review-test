@@ -1,0 +1,92 @@
+name: p0-v13-dependency-review
+
+# V13: actions/dependency-review-action on a pull_request_target fork PR, with no
+# checkout, and base-ref / head-ref set to the merge base SHA and the head SHA.
+# The fork PR adds a known vulnerable version (test-fixtures/p0/v13). Pass when the
+# dependency-review job FAILS. The report job prints the job result and the exported
+# step outcome, as the real gate reads them.
+#
+# Runs only for PR head branches that start with p0-v13.
+# Needs the dependency graph on this repo.
+# No checkout. The only third-party code is the pinned dependency-review-action.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  snapshot:
+    name: snapshot
+    if: startsWith(github.event.pull_request.head.ref, 'p0-v13')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.pair.outputs.head_sha }}
+      merge_base_sha: ${{ steps.pair.outputs.merge_base_sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Comparison pair (merge base, head) from the API
+        id: pair
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          base_tip=$(gh api "repos/$REPO/pulls/$PR" --jq .base.sha)
+          [ "$head" = "$EVENT_HEAD" ] || { echo "stale: live head $head != event head $EVENT_HEAD"; exit 1; }
+          mb=$(gh api "repos/$REPO/compare/$base_tip...$head" --jq .merge_base_commit.sha)
+          [[ "$mb" =~ ^[0-9a-f]{40}$ ]] || { echo "no merge base"; exit 1; }
+          echo "head_sha=$head" >> "$GITHUB_OUTPUT"
+          echo "merge_base_sha=$mb" >> "$GITHUB_OUTPUT"
+          jq -n --arg h "$head" --arg t "$base_tip" --arg m "$mb" '{head_sha:$h, base_tip:$t, merge_base_sha:$m}' | tee -a "$GITHUB_STEP_SUMMARY"
+
+  dependency-review:
+    name: dependency-review
+    needs: snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.dr.outcome }}
+      vulnerable_changes: ${{ steps.dr.outputs.vulnerable-changes }}
+    steps:
+      - name: Dependency review (no checkout, SHA refs)
+        id: dr
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          base-ref: ${{ needs.snapshot.outputs.merge_base_sha }}
+          head-ref: ${{ needs.snapshot.outputs.head_sha }}
+          fail-on-severity: high
+          comment-summary-in-pr: never
+
+  report:
+    name: report
+    needs: [snapshot, dependency-review]
+    if: always() && needs.snapshot.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      SNAPSHOT: ${{ needs.snapshot.result }}
+      DR_RESULT: ${{ needs.dependency-review.result }}
+      DR_OUTCOME: ${{ needs.dependency-review.outputs.outcome }}
+      VULN: ${{ needs.dependency-review.outputs.vulnerable_changes }}
+    steps:
+      - name: Report
+        run: |
+          {
+            echo "### V13 result (pass when dependency-review is failure)"
+            echo '```json'
+            jq -n --arg s "$SNAPSHOT" --arg r "$DR_RESULT" --arg o "$DR_OUTCOME" --arg v "$VULN" \
+              '{snapshot:$s, "needs.dependency-review.result":$r, "step outcome (job output)":$o,
+                vulnerable_changes:($v | fromjson? // $v), v13_pass:($r == "failure")}'
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

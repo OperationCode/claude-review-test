@@ -1,0 +1,104 @@
+name: p0-v18-fork-objects
+
+# V18: can the base repo's GITHUB_TOKEN read a fork PR's head commit, tree and blobs
+# through the BASE repo's git API (repos/OperationCode/claude-review-test/git/...)?
+# Targets: the event PR (pull_request_target), the dispatch input PR, and every open
+# fork PR. Pass when every object read returns 200 and no tree is truncated.
+#
+# Triggers:
+#   pull_request_target  PRs whose head branch starts with p0-v18 (the spec case)
+#   workflow_dispatch    any PR number (runs against existing fork PRs, no fork push)
+#   pull_request         same-repo PRs from p0- or phase0- branches: runs from the PR's own copy,
+#                        so it can run before this file is merged
+#
+# No checkout, no third-party actions, no secrets, no PR text in scripts.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  pull_request:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to read (optional; open fork PRs are always read)"
+        required: false
+        default: ""
+      max_blobs:
+        description: "Blob reads per PR (cap)"
+        required: false
+        default: "200"
+
+permissions: {}
+
+jobs:
+  fork-objects:
+    name: fork-objects
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' && startsWith(github.event.pull_request.head.ref, 'p0-v18')) ||
+      (github.event_name == 'pull_request' &&
+       (startsWith(github.event.pull_request.head.ref, 'p0-') || startsWith(github.event.pull_request.head.ref, 'phase0-')) &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_PR: ${{ github.event.pull_request.number }}
+      INPUT_PR: ${{ inputs.pr_number }}
+      MAX_BLOBS: ${{ inputs.max_blobs || '200' }}
+    steps:
+      - name: Read fork head objects through the base repo
+        run: |
+          set -uo pipefail
+          [[ "$MAX_BLOBS" =~ ^[0-9]{1,4}$ ]] || MAX_BLOBS=200
+          targets=()
+          [ "$EVENT_NAME" = "pull_request_target" ] && targets+=("$EVENT_PR")
+          if [[ "$INPUT_PR" =~ ^[0-9]+$ ]]; then targets+=("$INPUT_PR"); fi
+          while read -r n; do targets+=("$n"); done < <(gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
+            --jq ".[] | select(.head.repo.full_name != \"$REPO\") | .number")
+          mapfile -t targets < <(printf '%s\n' "${targets[@]}" | sort -un)
+
+          status() {  # prints the HTTP status of a GET
+            gh api -i "$1" 2>/dev/null | head -n 1 | awk '{print $2}'
+          }
+          all='[]'
+          for n in "${targets[@]}"; do
+            pr=$(gh api "repos/$REPO/pulls/$n" --jq '{number, head_sha: .head.sha, head_repo: .head.repo.full_name, base_sha: .base.sha}')
+            head=$(jq -r .head_sha <<<"$pr"); base=$(jq -r .base_sha <<<"$pr")
+            commit_status=$(status "repos/$REPO/git/commits/$head")
+            tree=$(gh api "repos/$REPO/git/commits/$head" --jq .tree.sha 2>/dev/null || echo "")
+            tree_json=$(gh api "repos/$REPO/git/trees/$tree?recursive=1" 2>/dev/null || echo '{}')
+            truncated=$(jq -r '.truncated // "unknown"' <<<"$tree_json")
+            entries=$(jq '.tree // [] | length' <<<"$tree_json")
+            ok=0; bad=0; bad_list='[]'
+            while read -r b; do
+              s=$(status "repos/$REPO/git/blobs/$b")
+              if [ "$s" = "200" ]; then ok=$((ok+1)); else bad=$((bad+1)); bad_list=$(jq -c --arg b "$b" --arg s "$s" '. + [{blob:$b, http:$s}]' <<<"$bad_list"); fi
+            done < <(jq -r '.tree // [] | .[] | select(.type == "blob") | .sha' <<<"$tree_json" | head -n "$MAX_BLOBS")
+            mb=$(gh api "repos/$REPO/compare/$base...$head" --jq .merge_base_commit.sha 2>/dev/null || echo "")
+            mb_tree_status=""
+            if [ -n "$mb" ]; then
+              mbt=$(gh api "repos/$REPO/git/commits/$mb" --jq .tree.sha 2>/dev/null || echo "")
+              mb_tree_status=$(status "repos/$REPO/git/trees/$mbt?recursive=1")
+            fi
+            row=$(jq -n --argjson pr "$pr" --arg cs "$commit_status" --arg tree "$tree" --arg tr "$truncated" \
+              --argjson entries "$entries" --argjson ok "$ok" --argjson bad "$bad" --argjson bl "$bad_list" \
+              --arg mb "$mb" --arg mbs "$mb_tree_status" \
+              '$pr + {commit_http:$cs, tree_sha:$tree, tree_truncated:$tr, tree_entries:$entries, blobs_ok:$ok,
+                      blobs_failed:$bad, failed:$bl, merge_base:$mb, merge_base_tree_http:$mbs,
+                      pass:($cs == "200" and $tree != "" and $tr == "false" and $bad == 0 and $ok > 0)}')
+            all=$(jq -c --argjson r "$row" '. + [$r]' <<<"$all")
+          done
+          {
+            echo "### V18 fork head objects through the base repo git API"
+            echo "Pass when every row has pass: true."
+            echo '```json'
+            jq -n --arg ev "$EVENT_NAME" --argjson rows "$all" '{event:$ev, rows:$rows, all_pass:($rows | length > 0 and all(.pass))}'
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
