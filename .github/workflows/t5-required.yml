@@ -34,6 +34,9 @@ jobs:
       HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       REPO: ${{ github.repository }}
     steps:
+      - name: Wait
+        # T7: finish after a fast forged job. Static command, no PR text.
+        run: sleep 180
       - name: Gate
         run: |
           {
