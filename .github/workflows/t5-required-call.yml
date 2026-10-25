@@ -1,0 +1,20 @@
+name: t5-required-call
+
+# T5 Q3: can a ruleset-required workflow call a reusable workflow (workflow_call)
+# and pass the PR number to it? Only used in ruleset phase B.
+# The callee lives in this repo because OperationCode/.github has no workflow yet.
+# The ref is mutable (@main) on purpose for the test. A real design pins a full SHA.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  call:
+    name: t5-call
+    permissions: {}
+    uses: OperationCode/claude-review-test/.github/workflows/t5-callee.yml@main
+    with:
+      pr_number: ${{ github.event.pull_request.number }}

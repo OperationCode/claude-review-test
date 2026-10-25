@@ -1,0 +1,23 @@
+{
+  "name": "t5-required-workflows",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [
+    { "actor_id": null, "actor_type": "OrganizationAdmin", "bypass_mode": "pull_request" }
+  ],
+  "conditions": {
+    "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] },
+    "repository_name": { "include": ["claude-review-test"], "exclude": [] }
+  },
+  "rules": [
+    {
+      "type": "workflows",
+      "parameters": {
+        "do_not_enforce_on_create": false,
+        "workflows": [
+          { "repository_id": 1432457406, "path": ".github/workflows/t5-required.yml", "ref": "refs/heads/main" }
+        ]
+      }
+    }
+  ]
+}

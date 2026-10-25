@@ -1,0 +1,46 @@
+name: t5-callee
+
+# T5 Q3: reusable workflow called by t5-required-call. Reports what it can see.
+# Result comes from the repo variable T5_CALL_GATE ("failure" fails, anything else passes).
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+
+permissions: {}
+
+jobs:
+  callee-gate:
+    name: callee-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      GATE: ${{ vars.T5_CALL_GATE }}
+      INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+      EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+      EVENT_NAME: ${{ github.event_name }}
+      WORKFLOW_REF: ${{ github.workflow_ref }}
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+      GITHUB_REF_VALUE: ${{ github.ref }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Gate
+        run: |
+          {
+            echo "### t5-callee (reusable workflow)"
+            echo "- input pr_number: $INPUT_PR_NUMBER"
+            echo "- github.event pr number: $EVENT_PR_NUMBER"
+            echo "- event: $EVENT_NAME, github.ref: $GITHUB_REF_VALUE, repository: $REPO"
+            echo "- workflow_ref (expected: the caller): $WORKFLOW_REF"
+            echo "- workflow_sha: $WORKFLOW_SHA"
+            echo "- gate variable T5_CALL_GATE: ${GATE:-<unset>}"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$GATE" = "failure" ]; then
+            echo "callee gate: failing on purpose"
+            exit 1
+          fi
+          echo "callee gate: success"

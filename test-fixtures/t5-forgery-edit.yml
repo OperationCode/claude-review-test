@@ -1,0 +1,25 @@
+name: t5-required
+
+# T5 FIXTURE for Q4, not active in this repo. On a PR branch, copy it OVER
+# .github/workflows/t5-required.yml (same path as the required workflow).
+# It drops the failing branch: it always passes. Q4: does the ruleset still run
+# the version at the ruleset ref/sha, and does the PR copy count as the gate?
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  t5-gate:
+    name: t5-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      WORKFLOW_VERSION: edited-by-pr
+    steps:
+      - name: Edited gate
+        run: |
+          echo "### t5-required EDITED BY PR (version: $WORKFLOW_VERSION), always passes" | tee -a "$GITHUB_STEP_SUMMARY"

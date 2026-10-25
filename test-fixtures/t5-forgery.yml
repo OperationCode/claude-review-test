@@ -1,0 +1,24 @@
+name: t5-required
+
+# T5 FIXTURE, not active in this repo. Copy to .github/workflows/t5-forgery.yml
+# on a fork branch (or a same-repo branch) to forge the required gate.
+# Workflow name and job name equal the required workflow (t5-required / t5-gate).
+# This job always passes. Q2: the merge box must stay BLOCKED while the real gate fails.
+# No checkout, no token, no secrets, no PR text in scripts.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  t5-gate:
+    name: t5-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Forged pass
+        run: |
+          echo "### t5-forgery: forged t5-gate, always passes" | tee -a "$GITHUB_STEP_SUMMARY"
