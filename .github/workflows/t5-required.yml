@@ -2,9 +2,6 @@ name: t5-required
 
 # T5: required workflow for the org ruleset rule "Require workflows to pass before merging".
 # Result comes from the repo variable T5_GATE ("failure" fails, anything else passes).
-# Q2 job states (repo variables, trusted, set by the owner only):
-#   T5_SLEEP=<seconds>  job stays in progress that long before it reports (pending state)
-#   T5_SKIP=true        job is skipped (skipped state)
 # Ruleset workflows run on the default activity types only (opened, synchronize, reopened);
 # the types filter below is ignored by the ruleset and only matters for a normal run.
 # Do not add cancel-in-progress concurrency (GitHub lists it as a cause of failure).
@@ -20,13 +17,11 @@ permissions: {}
 jobs:
   t5-gate:
     name: t5-gate
-    if: vars.T5_SKIP != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 5
     permissions: {}
     env:
       GATE: ${{ vars.T5_GATE }}
-      SLEEP: ${{ vars.T5_SLEEP }}
       WORKFLOW_VERSION: v1
       WORKFLOW_REF: ${{ github.workflow_ref }}
       WORKFLOW_SHA: ${{ github.workflow_sha }}
@@ -44,7 +39,7 @@ jobs:
           {
             echo "### t5-required (self-contained gate)"
             echo "- version: $WORKFLOW_VERSION"
-            echo "- gate variable T5_GATE: ${GATE:-<unset>}, T5_SLEEP: ${SLEEP:-<unset>}"
+            echo "- gate variable T5_GATE: ${GATE:-<unset>}"
             echo "- event: $EVENT_NAME / $EVENT_ACTION"
             echo "- pr number (event payload): $PR_NUMBER"
             echo "- repository: $REPO, head repository: $HEAD_REPO (fork: $([ "$HEAD_REPO" = "$REPO" ] && echo no || echo yes))"
@@ -52,10 +47,6 @@ jobs:
             echo "- workflow_ref: $WORKFLOW_REF"
             echo "- workflow_sha: $WORKFLOW_SHA"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          case "$SLEEP" in
-            ''|*[!0-9]*) ;;
-            *) echo "gate: sleeping $SLEEP s (pending state)"; sleep "$SLEEP" ;;
-          esac
           if [ "$GATE" = "failure" ]; then
             echo "gate: failing on purpose"
             exit 1

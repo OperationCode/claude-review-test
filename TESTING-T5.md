@@ -6,220 +6,158 @@ Local design. Nothing here is pushed. The owner (`irvingpop`, org admin) runs ev
 
 | Q | Question |
 |---|----------|
-| Q1 | Does an org ruleset (workflows rule, target only `claude-review-test`) run the required workflow (`pull_request_target`) on same-repo and fork PRs, and does its result block or allow the merge? |
-| Q2 | Is the workflows rule bound to the WORKFLOW or only to the job NAME? A PR adds its own `on: pull_request` workflow with a job named like the required job. Test with a name-bound control (plain required-status-check rule on `t5-gate`) and the workflows rule, in matched job states, on a fork PR and a same-repo PR. |
-| Q3 | Can the required workflow read the PR number and call a reusable workflow (`workflow_call`)? |
-| Q4 | Does the ruleset accept a pinned `sha`? What happens when a PR edits the workflow at the same path in the target repo (PR copy runs on `pull_request`)? |
+| Q2 | Can a same-name job from a fork PR's own workflow satisfy (a) a plain required-status-check rule (expected yes, positive control) and (b) the org workflows rule (we hope no)? |
+| Q1 | Does the org workflows rule run on same-repo and fork PRs, and does its result block or allow the merge? (sanity for Q2) |
+| Q3 | Can the required workflow call a reusable workflow (`workflow_call`) and pass the PR number? |
+| Q4 | Does the ruleset accept a pinned `sha` and keep running it after `main` moves? Does a same-path edit in a PR replace the required run? |
 
 ## Design
 
 ```
- org ruleset "t5-required-workflows"  (target: claude-review-test only, default branch)
-   rule: workflows  ->  repository_id 1432457406 (claude-review-test itself)
-                        path .github/workflows/t5-required.yml  @ refs/heads/main
-                        (phase B adds t5-required-call.yml, phase C pins a sha)
-
- t5-required.yml       job "t5-gate"      result = repo variable T5_GATE
- t5-required-call.yml  job "t5-call"  ->  t5-callee.yml (workflow_call)
-                                          result = repo variable T5_CALL_GATE
- test-fixtures/t5-forgery.yml       forged job "t5-gate" (always passes)
- test-fixtures/t5-forgery-edit.yml  same-path edit of t5-required.yml (pull_request, always passes)
+ org ruleset "t5-required-workflows" (target: claude-review-test only, default branch)
+   rule: workflows -> repository_id 1432457406, .github/workflows/t5-required.yml @ refs/heads/main
+ t5-required.yml       job "t5-gate"  result = repo variable T5_GATE (failure fails, else passes)
+ t5-required-call.yml  job "t5-call" -> t5-callee.yml (workflow_call), result = T5_CALL_GATE
+ test-fixtures/t5-forgery.yml       forged "t5-gate", always passes (PR branch, event pull_request)
+ test-fixtures/t5-forgery-edit.yml  same-path edit of t5-required.yml, always passes
  repo ruleset "t5-name-control"     plain required status check "t5-gate" (name-bound control)
 ```
 
-Real job states for Q2 (repo variables on the real `t5-gate`): `fail` = `T5_GATE=failure`; `pending` = `T5_SLEEP=300` (read while the job runs); `skipped` = `T5_SKIP=true`; `absent` = normal workflow disabled (name-bound control only).
+PRs: A = same-repo, no forgery (control). C = same-repo forgery. D = fork forgery. E = same-path edit. PR #4 (kylemh, outsider fork) is read-only.
 
-Where the required workflow lives: in `claude-review-test` itself. Reasons: no PR approval in `OperationCode/.github`, no test file in the production repo, and no deadlock if the file reaches `main` before the ruleset exists. Limits of this choice are in the report (`report-T5-design.md`): the file also runs as a normal workflow (confounder, see below), and a different-repo same-path attack is not tested.
+The required file lives in `claude-review-test` itself, so it also runs as a NORMAL `pull_request_target` workflow. Keep that normal workflow DISABLED (`gh workflow disable t5-required.yml`) in every row except K2. Then the only `t5-gate` runs on a head are the ruleset run (Checks tab marks it "Required") and the forged run.
 
-Confounder: with source repo = target repo, `t5-required.yml` also runs as a NORMAL `pull_request_target` workflow, so a PR can show two runs named `t5-gate`. Rules to tell them apart:
-- The Checks tab marks the ruleset run "Required". Record that run id and its `gh api repos/$R/actions/runs/<id> --jq '{event,path,name,workflow_id}'`. Diff it against the normal run.
-- Step A3b disables the normal workflow BEFORE any Q1 or Q2 (workflows rule) read. A run that still starts on a new PR event is the ruleset run. If A3b shows that disabling the file also stops the ruleset run, write that down (it is a finding), re-enable, and mark Q1 and Q2 as read with the confounder.
+Scope: owner-made fork PRs do not exercise the outsider approval gate (`first_time_contributors`). A different-repo same-path attack is not tested. Both are follow-ups.
 
-Scope notes: `fork-pr-contributor-approval` is `first_time_contributors` and the owner is an org admin, so an OUTSIDER fork approval gate is not exercised by owner-made fork PRs (D, F). PR #4 (kylemh) is a real outside-contributor fork PR: use it for the Q1 read and record whether its run needed approval. Q2 covers job substitution only, not the "outsider run waits for approval, real job absent" path. Open PRs #2, #3, #5, #6, #7 (same repo) also fall under the active org rule and get blocked when they next get an event. Cleanup does not touch them.
+## Rules for every row
 
-Read the real check names in the merge box. This plan uses the job names (`t5-gate`, `t5-call`, `callee-gate`). A required workflow can show a longer name. Write down what you see.
-
-## Variables and commands
+1. Fresh head SHA per row. Set the variables FIRST, then run `bump` (an empty commit pushed to the PR branch). Do not close and reopen: that keeps the old SHA and its old runs.
+2. A row reads only runs of its own head SHA (`rd` below prints them).
+3. Wait until every check run of the head is `completed`, then read twice, 10 seconds apart.
 
 ```sh
 cd /Users/irving/src/operationcode/claude-review-test
 R=OperationCode/claude-review-test
-# merge box state of PR N:
-gh pr view N --repo $R --json mergeStateStatus,mergeable,statusCheckRollup
-# runs of the head: 
-gh run list --repo $R --limit 10 --json databaseId,name,event,status,conclusion,headSha,workflowName
+# bump <branch> <label> <remote>   remote: git@github.com:$R.git, or "fork" for PR D
+bump() { git switch -q "$1" && git commit --allow-empty -qm "t5 $2" && git push -q "$3" "$1"; }
+# rd <pr>   merge box + every check run of the current head
+rd() { sleep 10; H=$(gh pr view "$1" --repo $R --json headRefOid --jq .headRefOid)
+  echo "PR $1 head ${H:0:7}"; gh pr view "$1" --repo $R --json mergeStateStatus --jq .mergeStateStatus
+  gh api repos/$R/commits/$H/check-runs --jq '.check_runs[]|[.name,.status,.conclusion,.id]|@tsv'; }
 ```
 
-`mergeStateStatus` is the merge box. `CLEAN` = can merge. `BLOCKED` = a required rule is not met. Do not use `statusCheckRollup.state` as the gate (T4 showed it can differ). As org admin you see a bypass option on a BLOCKED PR. The bypass option does not change `mergeStateStatus`. Do not use it.
+`mergeStateStatus` is the merge box: `CLEAN` can merge, `BLOCKED` a required rule is not met. Do not use `statusCheckRollup.state`. As org admin you see a bypass option on a BLOCKED PR. Do not use it. Read the real check names in the merge box and write them down (a required workflow can show a longer name).
 
-Wait until every run of a step has finished before you read the state. Read twice, 10 seconds apart.
-
-## Phase 0. Setup (owner)
+## Phase 0. Setup
 
 | # | Action | Expected |
 |---|--------|----------|
-| 0.1 | `gh auth refresh -h github.com -s admin:org` | token can read and write org rulesets |
-| 0.2 | Save the repo ruleset: `gh api repos/$R/rulesets/25791558 > /Users/irving/src/operationcode/claude-review-test/results-T5-require-scn.json` | file saved (inside the repo dir, do not commit it) |
-| 0.3 | Disable the repo ruleset `require-scn`: `gh api -X PUT repos/$R/rulesets/25791558 -f enforcement=disabled` | `enforcement: disabled`. Only the org rule must gate during T5. |
-| 0.4 | Push branch `t5-required-workflows` over SSH (`git push git@github.com:$R.git t5-required-workflows`). Open a PR to `main` and merge it. | `main` has the 3 workflow files and `test-fixtures/`. Over HTTPS the push needs the `workflow` token scope. |
-| 0.5 | `git switch main && git pull`, then `S1=$(git rev-parse HEAD)` and keep `$S1`. | `S1` is the commit where `WORKFLOW_VERSION: v1` |
-| 0.6 | `gh variable set T5_GATE --repo $R --body success` and `gh variable set T5_CALL_GATE --repo $R --body success` | 2 variables |
-| 0.7 | Record the ruleset list: `gh api orgs/OperationCode/rulesets` | no `t5` ruleset yet |
-| 0.8 | Create a same-repo control branch: `git switch -c t5-ctrl main`, add one line to `README.md`, `git push git@github.com:$R.git t5-ctrl`, `gh pr create --repo $R --base main --head t5-ctrl --title "t5 control" --body "T5 control"` | PR "A" (same-repo). Note its number. |
+| 0.1 | `gh auth refresh -h github.com -s admin:org` | token can write org rulesets |
+| 0.2 | `gh api repos/$R/rulesets/25791558 > results-T5-require-scn.json` (in the repo dir, do not commit) | saved |
+| 0.3 | `gh api -X PUT repos/$R/rulesets/25791558 -f enforcement=disabled` | `disabled`. Only the T5 rules gate. While `t5-name-control` or the org rule is active, direct pushes to `main` and merges of open PRs #2, #3, #5, #6, #7 are blocked. Keep the test short. |
+| 0.4 | `git push git@github.com:$R.git t5-required-workflows`, open a PR to `main`, merge it | `main` has the workflows and fixtures (SSH push; HTTPS needs the `workflow` scope) |
+| 0.5 | `git switch main && git pull; S1=$(git rev-parse HEAD)` | `S1` = commit with `WORKFLOW_VERSION: v1` |
+| 0.6 | `gh variable set T5_GATE --repo $R --body success; gh variable set T5_CALL_GATE --repo $R --body success` | 2 variables |
+| 0.7 | `gh workflow disable t5-required.yml --repo $R; gh workflow disable t5-required-call.yml --repo $R` | normal runs off. `t5-callee.yml` is `workflow_call` only. |
+| 0.8 | PR A: `git switch -c t5-ctrl main`, add a line to `README.md`, commit, push, `gh pr create --repo $R --base main --head t5-ctrl --title "t5 control" --body "T5 control"` | note number |
+| 0.9 | PR C: `git switch -c t5-forge-same main; mkdir -p .github/workflows; cp test-fixtures/t5-forgery.yml .github/workflows/`, commit, push, open PR (`--head t5-forge-same`) | forgery file only |
+| 0.10 | PR D: `gh repo fork $R --clone=false; git remote add fork git@github.com:irvingpop/claude-review-test.git`. Sync the fork (`gh repo sync irvingpop/claude-review-test`). `git switch -c t5-forge-fork main`, copy the same file, commit, `git push fork t5-forge-fork`, `gh pr create --repo $R --base main --head irvingpop:t5-forge-fork --title "t5 forgery fork" --body "T5 Q2"` | forgery file only |
+| 0.11 | `gh api orgs/OperationCode/rulesets` | no `t5` ruleset yet |
 
-Fork PR "B" is existing PR #4 (author `kylemh`).
+Fork PR runs can wait for approval: the owner needs none. If a run shows "Approve and run", write it down and do not approve.
 
-## Phase A. Q1 (gate only)
-
-| # | Action | Expected | Read |
-|---|--------|----------|------|
-| A1 | Create the ruleset: `gh api -X POST orgs/OperationCode/rulesets --input test-fixtures/ruleset/t5-org-ruleset.json` (copy in `test-fixtures/ruleset/`). Keep the `id` as `$RS`. | HTTP 201. If 422 or 403 on the `workflows` rule: stop and record the exact status and error text. Do not assume the cause (plan limit, permission, schema). | response body |
-| A2 | Check: `gh api orgs/OperationCode/rulesets/$RS --jq '.conditions,.rules'` | `repository_name.include = ["claude-review-test"]` only. Rule has `repository_id 1432457406`. | JSON |
-| A3 | PR A and PR B were open before the rule. Run `gh pr close N` then `gh pr reopen N` for each. | New run of `t5-required` (event `pull_request_target`, action `reopened`) per PR. Note: the file is also a normal workflow in this repo, so you can see TWO runs per PR (one normal, one from the ruleset). Write down both (run id, `path`, check name). | `gh run list`, Checks tab |
-| A3b | `gh workflow disable t5-required.yml --repo $R`, then close and reopen A and B. | Confounder control. Does the ruleset run still start? Only that run exists now (event, path, check name). Keep the normal workflow disabled for A4 to A8 and for phase A2. | `gh run list`, Checks tab |
-| A4 | Read the merge box of A and B. T5_GATE is `success`. | `CLEAN` (or `UNSTABLE`, if other unrelated checks fail). Required check listed as required. | `gh pr view` |
-| A5 | `gh variable set T5_GATE --repo $R --body failure`, then close and reopen A. Then B. | Run fails. `BLOCKED` for A and B. | `gh pr view` |
-| A6 | `gh variable set T5_GATE --repo $R --body success`, close and reopen A and B. | `CLEAN` again. Gate follows the newest result. | `gh pr view` |
-| A7 | Push a new commit to `t5-ctrl` (synchronize event). Set `T5_GATE=failure` first. | New run, `BLOCKED`. Shows `synchronize` is covered. | `gh pr view` |
-| A8 | `gh api orgs/OperationCode/rulesets/rule-suites --jq '.[0:5]'` | rule suite evaluation records for the PRs (optional) | JSON |
-
-Q1 is answered YES when: the run marked "Required" starts on both PRs (also with the normal workflow disabled, A3b) without any approval click, and BLOCKED/CLEAN follows `T5_GATE`. Write down any approval prompt on PR B (#4, outside contributor). Q1 says "owner fork PR" only for D and F.
-
-## Phase K. Q2 control: name-bound rule (run BEFORE phase A2)
-
-Purpose: show that a same-name job DOES satisfy a plain required-status-check rule, so a `BLOCKED` in phase A2 means something. Org workflows rule is off here; only the name-bound rule gates.
-
-Create the forgery PRs C (same-repo) and D (fork) first (commands in phase A2). Then:
+## Phase K. Q2 (a): plain required-status-check rule (org ruleset not created yet)
 
 ```sh
-gh api -X PUT orgs/OperationCode/rulesets/$RS -f enforcement=disabled                  # org workflows rule off
-gh api -X POST repos/$R/rulesets --input test-fixtures/ruleset/t5-repo-name-control.json   # keep id as $NR
-gh workflow enable t5-required.yml --repo $R                                           # real job runs normally
+gh api -X POST repos/$R/rulesets --input test-fixtures/ruleset/t5-repo-name-control.json   # note id as $NR
 ```
 
-Matched states. For each row set the variables, close and reopen the PR, wait, read the merge box twice, 10 s apart. For `pending`, read while the real run is still in progress and the forged run has finished.
-
-| # | State of real `t5-gate` | Variables | PR | Expected (name-bound) | Meaning |
+| # | Real `t5-gate` | Setup, then `bump` each PR | PR | Expected | Meaning |
 |---|---|---|---|---|---|
-| K1 | pass, no forgery | `T5_GATE=success` | A | `CLEAN` | sanity: the rule is satisfiable |
-| K2 | absent, no forgery | `gh workflow disable t5-required.yml`, PR A reopen | A | `BLOCKED` (expected check missing) | sanity: absence blocks |
-| K3 | absent, forged pass | normal workflow still disabled | C, D | `CLEAN` | POSITIVE CONTROL: forgery by name works in this repo. Needs `CLEAN` on C and D. If `BLOCKED`, the forgery fixture does not work; stop and fix before A2. |
-| K4 | fail, forged pass | `gh workflow enable ...`, `T5_GATE=failure` | C, D | record (`BLOCKED` or `CLEAN`) | does a mixed fail+pass under one name block? Decides whether A2 row S-fail can discriminate. |
-| K5 | pending, forged pass | `T5_GATE=success`, `T5_SLEEP=300` | C, D | record | name-bound result with the real job in progress |
-| K6 | skipped, forged pass | `T5_SLEEP` deleted, `T5_SKIP=true` | C, D | record | skipped job and forged pass under one name |
-| K7 | skipped, no forgery | `T5_SKIP=true` | A | record | does a skipped real job alone satisfy a name-bound rule (docs say skipped counts as success) |
+| K1 | absent (normal workflow disabled) | none | C, D | `CLEAN` | POSITIVE CONTROL: a forged same-name job satisfies a name rule. If `BLOCKED`, the fixture does not work: stop and fix. |
+| K2 | fail | `gh workflow enable t5-required.yml --repo $R`, `T5_GATE=failure` | C, D | record `BLOCKED` or `CLEAN` | does a real fail plus a forged pass under one name block? Decides whether W1 can discriminate. |
 
-Then restore: `gh variable delete T5_SLEEP --repo $R; gh variable delete T5_SKIP --repo $R; gh workflow enable t5-required.yml --repo $R`, then `gh api -X DELETE repos/$R/rulesets/$NR`, then `gh api -X PUT orgs/OperationCode/rulesets/$RS -f enforcement=active`, then `gh workflow disable t5-required.yml --repo $R` (normal run off again for phase A2).
+Then: `gh workflow disable t5-required.yml --repo $R; gh variable set T5_GATE --repo $R --body success; gh api -X DELETE repos/$R/rulesets/$NR`.
 
-## Phase A2. Q2 forgery against the workflows rule (normal workflow disabled, A3b)
-
-Org ruleset `active`, repo rule `t5-name-control` deleted. Same states as phase K, so every row pairs with a K row.
-
-Same-repo forgery (owner, PR "C"), skip if it exists from phase K:
+## Phase W. Q1 and Q2 (b): org workflows rule
 
 ```sh
-git switch -c t5-forge-same main
-mkdir -p .github/workflows
-cp test-fixtures/t5-forgery.yml .github/workflows/t5-forgery.yml
-git add .github/workflows/t5-forgery.yml && git commit -m "t5 forgery same-repo"
-git push git@github.com:$R.git t5-forge-same
-gh pr create --repo $R --base main --head t5-forge-same --title "t5 forgery same-repo" --body "T5 Q2"
+gh api -X POST orgs/OperationCode/rulesets --input test-fixtures/ruleset/t5-org-ruleset.json   # HTTP 201, note id as $RS
+gh api orgs/OperationCode/rulesets/$RS --jq '.conditions,.rules'   # include = ["claude-review-test"] only
 ```
 
-Fork forgery (owner forks to the owner account, PR "D"), skip if it exists from phase K:
+If the POST returns 422 or 403 on the `workflows` rule: stop, record the exact status and text, do not assume the cause. The normal workflow stays disabled.
 
-```sh
-gh repo fork $R --clone=false          # creates irvingpop/claude-review-test
-git remote add fork git@github.com:irvingpop/claude-review-test.git
-git switch -c t5-forge-fork main
-mkdir -p .github/workflows
-cp test-fixtures/t5-forgery.yml .github/workflows/t5-forgery.yml
-git add .github/workflows/t5-forgery.yml && git commit -m "t5 forgery fork"
-git push fork t5-forge-fork
-gh pr create --repo $R --base main --head irvingpop:t5-forge-fork --title "t5 forgery fork" --body "T5 Q2"
-```
-
-The forgery branch adds exactly one file: `.github/workflows/t5-forgery.yml` (copy of `test-fixtures/t5-forgery.yml`). If the fork is older than the merge of step 0.4, sync it first (`gh repo sync irvingpop/claude-review-test`).
-
-| # | State of real (ruleset) `t5-gate` | Variables | PR | Expected (workflow-bound) | Pairs with |
+| # | Real (ruleset) `t5-gate` | Setup, then `bump` | PR | Expected | Meaning |
 |---|---|---|---|---|---|
-| F1 | fail, forged pass | `T5_GATE=failure` | C, D | `BLOCKED` | K4 |
-| F2 | pending, forged pass | `T5_GATE=success`, `T5_SLEEP=300` | C, D | `BLOCKED` while the ruleset run is in progress | K5 |
-| F3 | skipped, forged pass | `T5_SLEEP` deleted, `T5_SKIP=true` | C, D | record | K6 |
-| F4 | skipped, no forgery | `T5_SKIP=true` | A | record | K7 |
-| F5 | pass, forged pass | `T5_SKIP` deleted, `T5_GATE=success` | C, D | `CLEAN` (a forged job does not break a good PR) | K1 |
-| F6 | fail, forged pass, after a new commit | `T5_GATE=failure`, push a commit to each forgery branch | C, D | `BLOCKED` stays | K4 |
+| W0 | pass | `T5_GATE=success` | A | the Required run starts, no approval click. `CLEAN`. | Q1 sanity. Also record `gh api repos/$R/actions/runs/<id> --jq '{event,path,name}'` of the Required run. If no run starts with the normal workflow disabled, the ruleset run depends on it: record, mark all W rows confounded. |
+| W0b | fail | `T5_GATE=failure` | A | `BLOCKED` | Q1: the result gates the merge |
+| W1 | fail, forged pass | `T5_GATE=failure` | C, D | `BLOCKED` | Q2 (b). `CLEAN` means the forged job satisfies the workflows rule. |
+| W2 | outsider fork | close and reopen PR #4 (no push possible) | #4 | run starts? approval needed? | Q1 outsider read, record only |
 
-Read both runs by name: Checks tab lists the real run (marked "Required") and the forged run (event `pull_request`) both as `t5-gate`. Fork PR runs can wait for approval: the owner needs none; if a run shows "Approve and run", write it down and do not approve.
+## Decision (Q2)
 
-Decision (binding proof): the rule is bound to the WORKFLOW (not the name) when, for some state S, the K row is `CLEAN` and the matching F row is `BLOCKED`. Readings:
-- K3 `CLEAN` is required first (forgery works by name). Without it nothing below counts.
-- K4 `CLEAN` and F1 `BLOCKED`: fail+forged discriminates, binding is to the workflow.
-- K4 `BLOCKED`: F1 proves nothing (both block). Use the K5/F2 pair: K5 `CLEAN` and F2 `BLOCKED` proves it.
-- Any F row `CLEAN` where the real run did not pass (F2, F3): the forgery works against the workflows rule too. Record as a finding.
-- F4 `CLEAN`: a skippable real job lets any PR through. Gate jobs must never be skippable.
-- No state discriminates: Q2 stays open. Do not claim either result.
+| K1 | K2 | W1 | Result |
+|---|---|---|---|
+| `BLOCKED` | any | any | invalid, fixture broken, fix and rerun |
+| `CLEAN` | `CLEAN` | `BLOCKED` | workflows rule is bound to the workflow, not the job name. Forgery fails. |
+| `CLEAN` | any | `CLEAN` | forgery WORKS against the workflows rule. Finding: the reviewer gate cannot rely on it alone. |
+| `CLEAN` | `BLOCKED` | `BLOCKED` | OPEN. A real fail blocks under both hypotheses. Do not claim either result. Follow-up: real job pending state (`sleep` variant), forged job finishing later. |
 
 ## Phase B. Q3 (reusable workflow)
 
-| # | Action | Expected | Read |
-|---|--------|----------|------|
-| B1 | `gh api -X PUT orgs/OperationCode/rulesets/$RS --input test-fixtures/ruleset/t5-org-ruleset-phaseB.json` | HTTP 200, 2 workflows in the rule | response |
-| B2 | `T5_GATE=success`, `T5_CALL_GATE=success`. Close and reopen A. | Run `t5-required-call` starts. Job `t5-call` calls `t5-callee`. | `gh run list` |
-| B3 | Open the run summary of `t5-callee`. | `input pr_number` and `github.event pr number` both equal the PR number. `workflow_ref` shows the caller or the callee: write it down. | Summary page |
-| B4 | `T5_CALL_GATE=failure`, close and reopen A. | `BLOCKED` by the call workflow alone (T5_GATE is success) | `gh pr view` |
-| B5 | `T5_CALL_GATE=success`, close and reopen A. | `CLEAN` | `gh pr view` |
-| B6 | Repeat B2 and B4 on fork PR D. | Same result as A. If the call fails to start (access error), write the exact message. | `gh pr view` |
+Normal runs of both files stay disabled (0.7), so only the ruleset runs exist.
 
-Q3 is answered YES when B3 shows the number and B4 blocks. If B2 never starts a run: a required workflow cannot use `workflow_call` (or needs a setting). Then the design must be self-contained.
+| # | Setup, then `bump` A | Expected |
+|---|---|---|
+| B1 | `gh api -X PUT orgs/OperationCode/rulesets/$RS --input test-fixtures/ruleset/t5-org-ruleset-phaseB.json` (200, 2 workflows). `T5_GATE=success`, `T5_CALL_GATE=success` | the Required run `t5-call` starts and calls `t5-callee`. `CLEAN`. Summary: `input pr_number` and the event PR number both equal A. Write down `workflow_ref`. |
+| B2 | `T5_CALL_GATE=failure` | `BLOCKED` by the call alone (T5_GATE is success) |
 
-## Phase C. Q4 (pinned sha, same-path edit)
+Q3 is YES when B1 shows the number and B2 blocks. If no run starts, a required workflow cannot use `workflow_call` here; the design must be self-contained. Then `T5_CALL_GATE=success`.
 
-| # | Action | Expected | Read |
-|---|--------|----------|------|
-| C1 | Edit `test-fixtures/ruleset/t5-org-ruleset-phaseC-sha.json`: replace `REPLACE_WITH_40_CHAR_COMMIT_SHA` with `$S1`. `gh api -X PUT orgs/OperationCode/rulesets/$RS --input test-fixtures/ruleset/t5-org-ruleset-phaseC-sha.json` | HTTP 200 and the response echoes `sha`. If 422 on `sha` without `ref`: record the text, retry with `"ref": "refs/heads/main"` and `sha` together. | response |
-| C2 | Close and reopen A. Read the `t5-required` summary. | `workflow_sha` equals `$S1`, `version: v1` | summary |
-| C3 | Advance `main`: branch `t5-v2` from `main`, change `WORKFLOW_VERSION: v1` to `v2` in `.github/workflows/t5-required.yml`. Set `T5_GATE=success`. Push, open PR, merge it. | `main` moves to `S2` | git |
-| C4 | Close and reopen A. | The ruleset still runs `v1`, `workflow_sha` = `$S1` (the pin holds). A normal run from `main` shows `v2`. | summary of both runs |
-| C5 | Put phase A back: `PUT ... --input test-fixtures/ruleset/t5-org-ruleset.json`. Close and reopen A. | the ruleset run now shows `v2` (ref follows `main`) | summary |
-| C6 | Same-path edit, same repo. Run `gh workflow enable t5-required.yml --repo $R` first (the PR copy needs the path enabled; if it still does not run, note that). Set `T5_GATE=failure`, `T5_SLEEP` and `T5_SKIP` deleted. `git switch -c t5-edit main && cp test-fixtures/t5-forgery-edit.yml .github/workflows/t5-required.yml`, commit, push, open PR "E". | Runs on the head: (1) PR copy, event `pull_request`, summary `edited-by-pr`, PASSES; (2) normal run from `main`, event `pull_request_target`, FAILS; (3) ruleset run (Required), version from ruleset ref, FAILS. Merge box `BLOCKED`. Write down every run with event and workflow_ref. | `gh pr view`, runs, summaries |
-| C7 | Same-path edit, fork. In the fork: `git switch -c t5-edit-fork main`, same copy, `git push fork t5-edit-fork`, PR "F" with `--head irvingpop:t5-edit-fork`. | Same as C6: `BLOCKED` | `gh pr view` |
-| C8 | Repeat C6 with the normal workflow disabled (`gh workflow disable t5-required.yml --repo $R`), reopen E. | Does the PR copy still run? Does the ruleset run still start? Write down both. Then enable the workflow again. | `gh pr view`, runs |
+## Phase C. Q4 (sha pin, same-path edit)
 
-Q4 is answered YES (pin accepted) when C1 is 200 and C4 shows `v1`. Same-path edit is harmless when C6 and C7 stay `BLOCKED` while the PR copy (event `pull_request`) is green. If the merge box is `CLEAN`, the PR copy replaced the required run: record as a finding.
+| # | Action | Expected |
+|---|--------|----------|
+| C1 | In `test-fixtures/ruleset/t5-org-ruleset-phaseC-sha.json` replace `REPLACE_WITH_40_CHAR_COMMIT_SHA` with `$S1`, then `PUT orgs/OperationCode/rulesets/$RS --input` that file. `T5_GATE=success`. `bump` A. | HTTP 200, response echoes `sha`. If 422 on `sha` alone: record the text, retry with `"ref": "refs/heads/main"` added. Run summary: `workflow_sha` = `$S1`, `version: v1`. |
+| C2 | PR "t5-v2": branch from `main`, change `v1` to `v2` in `.github/workflows/t5-required.yml`, merge it (the pinned v1 run must pass). `bump` A. | the ruleset run still shows `v1`, `workflow_sha` = `$S1`. The pin holds. |
+| C3 | `PUT` the original `t5-org-ruleset.json` back. `T5_GATE=failure`. PR E: `git switch -c t5-edit main; cp test-fixtures/t5-forgery-edit.yml .github/workflows/t5-required.yml`, commit, push, open PR. | Runs on the head: PR copy (event `pull_request`, summary `edited-by-pr`) passes; ruleset run (Required) fails. Merge box `BLOCKED`. Valid only if K2 is `CLEAN` (else this row is the same non-discriminating mix as W1). `CLEAN` means the PR copy replaced the required run: finding. |
 
-## Evidence to save
+Q4 pin is YES when C1 is 200 and C2 shows `v1`.
 
-For each step: the `gh pr view` JSON, the run ids, the check names as shown, the HTTP status and body of each ruleset call. Save to `/Users/irving/src/operationcode/claude-review-test/results-T5.md` (do not commit secrets; there are none).
+## Evidence
+
+Per row: `rd` output (head SHA, merge box, check runs), run ids, the check names as shown, HTTP status and body of each ruleset call. Save to `results-T5.md` in the repo dir (no secrets).
 
 ## Cleanup
 
-If the test stops at ANY phase, run the first 2 lines (plus the `$NR` delete if phase K was started) first.
+If the test stops at ANY point, run the first block first. IDs are looked up by name, so a lost shell variable does not matter.
 
 ```sh
-gh api -X DELETE orgs/OperationCode/rulesets/$RS              # delete the org ruleset
-gh api orgs/OperationCode/rulesets                             # check: no t5 ruleset
-gh api -X DELETE repos/$R/rulesets/$NR || true                 # name-bound control, if it exists
+RS=$(gh api orgs/OperationCode/rulesets --jq '.[]|select(.name=="t5-required-workflows").id')
+[ -n "$RS" ] && gh api -X DELETE orgs/OperationCode/rulesets/$RS
+NR=$(gh api repos/$R/rulesets --jq '.[]|select(.name=="t5-name-control").id')
+[ -n "$NR" ] && gh api -X DELETE repos/$R/rulesets/$NR
+gh api orgs/OperationCode/rulesets --jq '.[].name'             # check: no t5 ruleset
 gh api repos/$R/rulesets --jq '.[].name'                       # check: no t5-name-control
 gh variable delete T5_GATE --repo $R
 gh variable delete T5_CALL_GATE --repo $R
-gh variable delete T5_SLEEP --repo $R || true
-gh variable delete T5_SKIP --repo $R || true
 gh api -X PUT repos/$R/rulesets/25791558 -f enforcement=active # restore require-scn
 gh api repos/$R/rulesets/25791558 --jq .enforcement            # expect: active
-for n in <A> <C> <D> <E> <F>; do gh pr close $n --repo $R --delete-branch || true; done   # fork branches (D, F) cannot be deleted here: error is harmless
+for n in <A> <C> <D> <E>; do gh pr close $n --repo $R --delete-branch || true; done   # fork branch of D stays until the fork is deleted
 gh workflow disable t5-required.yml --repo $R
 gh workflow disable t5-required-call.yml --repo $R
 gh workflow disable t5-callee.yml --repo $R
 gh repo delete irvingpop/claude-review-test --yes              # needs delete_repo scope; or use the UI
 ```
 
-Cleanup does NOT revert the test files merged to `main` in step 0.4; it only disables the workflows. To remove them, open a revert PR (the org rule is deleted by then, so no gate). Optional.
+If a ruleset cannot be deleted by API: Org settings, Rules, Rulesets, `t5-required-workflows`, Delete; for the repo ruleset, Repo settings, Rules, `t5-name-control`, Delete.
 
-PR #4 (kylemh) stays open. Branch `t5-forge-fork` and `t5-edit-fork` vanish with the fork. If the org ruleset cannot be deleted by API, use Org settings, Rules, Rulesets, `t5-required-workflows`, Delete.
+Cleanup does not revert the test files merged to `main`; it only disables the workflows. Optional: a revert PR (no gate after the rules are deleted). PR #4 stays open.
 
 ## Fail-safe notes
 
 - The org ruleset is `active` and applies to `claude-review-test` only. It blocks direct pushes to `main`: use PRs.
-- OrganizationAdmin can bypass on a PR. Do not bypass during the test.
-- Never leave `T5_GATE` unset on a real gate: unset means success (fail-open). This is test code only.
+- `OrganizationAdmin` can bypass on a PR. Do not bypass during the test.
+- Never leave `T5_GATE` unset on a real gate: unset means success (fail-open). Test code only.
+- Do not merge PRs C, D, E. They hold forged gates.
