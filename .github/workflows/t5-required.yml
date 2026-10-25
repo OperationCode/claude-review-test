@@ -1,15 +1,18 @@
 name: t5-required
 
-# T5: required workflow for the org ruleset rule "Require workflows to pass before merging".
-# Result comes from the repo variable T5_GATE ("failure" fails, anything else passes).
-# Ruleset workflows run on the default activity types only (opened, synchronize, reopened);
-# the types filter below is ignored by the ruleset and only matters for a normal run.
-# Do not add cancel-in-progress concurrency (GitHub lists it as a cause of failure).
-#
-# No checkout, no third-party actions, no token scopes, no secrets, no PR text in scripts.
+# T5 FIXTURE for Q4, not active in this repo. On a PR branch, copy it OVER
+# .github/workflows/t5-required.yml (same path, same workflow name, same job name
+# as the required workflow). It always FAILS, so row C3 can tell whether the
+# PR copy changes the merge box while the required run passes.
+# Trigger is pull_request on purpose: pull_request_target always runs the BASE
+# branch file, so the PR copy would never execute. With pull_request the PR copy
+# runs from the PR merge commit, like a real same-path attack.
+# Q4: does the ruleset still run the version at the ruleset ref/sha, and does this
+# PR copy (event pull_request) count as the gate? The summary prints the event and
+# workflow_ref so this run can be told apart from the base-branch runs.
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, reopened, synchronize]
 
 permissions: {}
@@ -21,34 +24,15 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     env:
-      GATE: ${{ vars.T5_GATE }}
-      WORKFLOW_VERSION: v1
-      WORKFLOW_REF: ${{ github.workflow_ref }}
-      WORKFLOW_SHA: ${{ github.workflow_sha }}
-      GITHUB_REF_VALUE: ${{ github.ref }}
-      BASE_SHA: ${{ github.sha }}
+      WORKFLOW_VERSION: edited-by-pr
       EVENT_NAME: ${{ github.event_name }}
-      EVENT_ACTION: ${{ github.event.action }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-      REPO: ${{ github.repository }}
+      WORKFLOW_REF: ${{ github.workflow_ref }}
     steps:
-      - name: Gate
+      - name: Edited gate
         run: |
           {
-            echo "### t5-required (self-contained gate)"
-            echo "- version: $WORKFLOW_VERSION"
-            echo "- gate variable T5_GATE: ${GATE:-<unset>}"
-            echo "- event: $EVENT_NAME / $EVENT_ACTION"
-            echo "- pr number (event payload): $PR_NUMBER"
-            echo "- repository: $REPO, head repository: $HEAD_REPO (fork: $([ "$HEAD_REPO" = "$REPO" ] && echo no || echo yes))"
-            echo "- head sha: $HEAD_SHA, github.sha: $BASE_SHA, github.ref: $GITHUB_REF_VALUE"
+            echo "### t5-required EDITED BY PR (version: $WORKFLOW_VERSION), always fails"
+            echo "- event: $EVENT_NAME"
             echo "- workflow_ref: $WORKFLOW_REF"
-            echo "- workflow_sha: $WORKFLOW_SHA"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          if [ "$GATE" = "failure" ]; then
-            echo "gate: failing on purpose"
-            exit 1
-          fi
-          echo "gate: success"
+          exit 1
