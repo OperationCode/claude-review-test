@@ -1,0 +1,153 @@
+name: p0-v13-dependency-review
+
+# V13: actions/dependency-review-action on a pull_request_target fork PR, with no
+# checkout, and base-ref / head-ref set to the merge base SHA and the head SHA.
+# Two fork PRs, same token, event and SHA-ref setup:
+#   p0-v13-vuln*  adds known vulnerable versions (test-fixtures/p0/v13): expect REJECT
+#   p0-v13-safe*  adds safe versions (test-fixtures/p0/v13/safe): the control, expect ALLOW
+# A red job alone is not a pass. The snapshot job calls the same dependency-graph compare
+# API the action uses and records its HTTP status and high/critical changes. The report
+# job classifies the run as PASS, FAIL (wrong verdict with a working API) or INCOMPLETE
+# (API or setup failure), and exits nonzero unless PASS.
+#
+# Runs only for PR head branches that start with p0-v13.
+# Needs the dependency graph on this repo.
+# No checkout. The only third-party code is the pinned dependency-review-action.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  snapshot:
+    name: snapshot
+    if: startsWith(github.event.pull_request.head.ref, 'p0-v13')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.pair.outputs.head_sha }}
+      merge_base_sha: ${{ steps.pair.outputs.merge_base_sha }}
+      compare_http: ${{ steps.compare.outputs.compare_http }}
+      compare_high: ${{ steps.compare.outputs.compare_high }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Comparison pair (merge base, head) from the API
+        id: pair
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          base_tip=$(gh api "repos/$REPO/pulls/$PR" --jq .base.sha)
+          [ "$head" = "$EVENT_HEAD" ] || { echo "stale: live head $head != event head $EVENT_HEAD"; exit 1; }
+          mb=$(gh api "repos/$REPO/compare/$base_tip...$head" --jq .merge_base_commit.sha)
+          [[ "$mb" =~ ^[0-9a-f]{40}$ ]] || { echo "no merge base"; exit 1; }
+          echo "head_sha=$head" >> "$GITHUB_OUTPUT"
+          echo "merge_base_sha=$mb" >> "$GITHUB_OUTPUT"
+          jq -n --arg h "$head" --arg t "$base_tip" --arg m "$mb" '{head_sha:$h, base_tip:$t, merge_base_sha:$m}' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Dependency-graph compare (the API the action calls), status and high/critical changes
+        id: compare
+        env:
+          HEAD_SHA: ${{ steps.pair.outputs.head_sha }}
+          MB_SHA: ${{ steps.pair.outputs.merge_base_sha }}
+        run: |
+          set -uo pipefail
+          out=$(mktemp)
+          code=$(curl -sS -o "$out" -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$REPO/dependency-graph/compare/$MB_SHA...$HEAD_SHA" || echo 000)
+          high=$(jq -c '[.[]? | select(.change_type == "added") | . as $c | .vulnerabilities[]?
+            | select(.severity == "high" or .severity == "critical")
+            | {name:$c.name, version:$c.version, severity, ghsa:.advisory_ghsa_id}]' "$out" 2>/dev/null || echo '[]')
+          [ -n "$high" ] || high='[]'
+          echo "compare_http=$code" >> "$GITHUB_OUTPUT"
+          echo "compare_high=$high" >> "$GITHUB_OUTPUT"
+          jq -n --arg code "$code" --argjson high "$high" --argjson n "$(jq 'if type == "array" then length else null end' "$out" 2>/dev/null || echo null)" \
+            '{compare_http:$code, changes:$n, high_or_critical_added:$high}' | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -f "$out"
+
+  dependency-review:
+    name: dependency-review
+    needs: snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.dr.outcome }}
+      vulnerable_changes: ${{ steps.dr.outputs.vulnerable-changes }}
+      dependency_changes: ${{ steps.dr.outputs.dependency-changes }}
+    steps:
+      - name: Dependency review (no checkout, SHA refs)
+        id: dr
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          base-ref: ${{ needs.snapshot.outputs.merge_base_sha }}
+          head-ref: ${{ needs.snapshot.outputs.head_sha }}
+          fail-on-severity: high
+          comment-summary-in-pr: never
+
+  report:
+    name: report
+    needs: [snapshot, dependency-review]
+    if: always() && needs.snapshot.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      SNAPSHOT: ${{ needs.snapshot.result }}
+      COMPARE_HTTP: ${{ needs.snapshot.outputs.compare_http }}
+      COMPARE_HIGH: ${{ needs.snapshot.outputs.compare_high }}
+      DR_RESULT: ${{ needs.dependency-review.result }}
+      DR_OUTCOME: ${{ needs.dependency-review.outputs.outcome }}
+      VULN: ${{ needs.dependency-review.outputs.vulnerable_changes }}
+      DEPS: ${{ needs.dependency-review.outputs.dependency_changes }}
+    steps:
+      - name: Classify (PASS, FAIL, INCOMPLETE)
+        run: |
+          set -uo pipefail
+          mode=vuln; [[ "$HEAD_REF" == p0-v13-safe* ]] && mode=safe
+          summary=$(jq -n --arg mode "$mode" --arg s "$SNAPSHOT" --arg ch "$COMPARE_HTTP" --arg chigh "$COMPARE_HIGH" \
+            --arg r "$DR_RESULT" --arg o "$DR_OUTCOME" --arg v "$VULN" --arg d "$DEPS" '
+            def arr: (fromjson? // null) | if type == "array" then . else null end;
+            ($chigh | arr // []) as $compare_high
+            | ($v | arr) as $vuln
+            | ($d | arr) as $deps
+            | ([$vuln[]? | . as $c | .vulnerabilities[]? | select(.severity == "high" or .severity == "critical")
+                | {name:$c.name, version:$c.version, severity}]) as $dr_high
+            | ([$dr_high[] | select(.name == "lodash" or .name == "minimist")] | length > 0) as $expected_hit
+            | ($s == "success" and $ch == "200") as $api_ok
+            | {mode:$mode, snapshot:$s, compare_http:$ch, compare_high:$compare_high,
+               "needs.dependency-review.result":$r, "step outcome (job output)":$o,
+               dependency_changes:($deps | length? // null), action_high_or_critical:$dr_high,
+               result:(
+                 if ($api_ok | not) then "INCOMPLETE"
+                 elif $mode == "vuln" then
+                   (if $o == "failure" and $r == "failure" and $expected_hit then "PASS"
+                    elif $o == "success" and ($compare_high | length > 0) then "FAIL"
+                    else "INCOMPLETE" end)
+                 else
+                   (if $o == "success" and $r == "success" and ($dr_high | length == 0) then "PASS"
+                    elif $o == "failure" and ($dr_high | length > 0) then "FAIL"
+                    else "INCOMPLETE" end)
+                 end)}')
+          {
+            echo "### V13 result ($mode PR)"
+            echo "vuln PASS: compare API 200, step outcome failure, the action lists lodash or minimist at high/critical."
+            echo "safe PASS: compare API 200, step outcome success, no high/critical change. INCOMPLETE = API or setup failure."
+            echo '```json'
+            echo "$summary"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          result=$(jq -r .result <<<"$summary")
+          echo "V13 $mode result: $result"
+          [ "$result" = "PASS" ]

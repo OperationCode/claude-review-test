@@ -1,0 +1,45 @@
+name: p0-v6-token-push
+
+# V6 (c), second half: move a same-repo PR head branch back to an earlier SHA with a
+# push made by GITHUB_TOKEN (H -> B -> H, return push by the token). Expected: no
+# required run starts, because ruleset workflows do not run on events from GITHUB_TOKEN.
+# Record what the merge box shows (scripts/p0/observe.sh).
+#
+# Only branches named p0-v6-* in this repo. Forks cannot be written with this token.
+# No checkout, no third-party actions, no secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Head branch in this repo (must start with p0-v6-)"
+        required: true
+      sha:
+        description: "40-hex SHA to force the branch to"
+        required: true
+
+permissions: {}
+
+jobs:
+  token-push:
+    name: token-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      BRANCH: ${{ inputs.branch }}
+      SHA: ${{ inputs.sha }}
+    steps:
+      - name: Force the branch ref with GITHUB_TOKEN
+        run: |
+          set -euo pipefail
+          [[ "$BRANCH" =~ ^p0-v6-[A-Za-z0-9._-]+$ ]] || { echo "branch must match p0-v6-*"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be 40 hex"; exit 1; }
+          before=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha)
+          gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$SHA" -F force=true --jq .object.sha >/dev/null
+          after=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha)
+          jq -n --arg b "$BRANCH" --arg x "$before" --arg y "$after" --arg t "$(date -u +%FT%TZ)" \
+            '{branch:$b, before:$x, after:$y, pushed_at:$t, by:"GITHUB_TOKEN"}' | tee -a "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,158 @@
+name: p0-v18-fork-objects
+
+# V18: can the base repo's GITHUB_TOKEN read a fork PR's head commit, tree and blobs
+# through the BASE repo's git API (repos/OperationCode/claude-review-test/git/...)?
+# Targets: the event PR (pull_request_target), the dispatch input PR, and every open
+# fork PR. Pass when the tree is valid and not truncated and every unique blob in it
+# returns 200. The step exits nonzero unless the result is PASS (no targets = INCOMPLETE).
+#
+# Triggers:
+#   pull_request_target  PRs whose head branch starts with p0-v18 (the spec case)
+#   workflow_dispatch    any PR number (runs against existing fork PRs, no fork push)
+#   pull_request         same-repo PRs from p0-v18* or phase0-* branches (not the V6 PRs): runs from the PR's own copy,
+#                        so it can run before this file is merged
+#
+# No checkout, no third-party actions, no secrets, no PR text in scripts.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  pull_request:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to read (optional; open fork PRs are always read)"
+        required: false
+        default: ""
+      max_blobs:
+        description: "Blob reads per PR (cap; a PR with more unique blobs is INCOMPLETE, not a pass)"
+        required: false
+        default: "2000"
+
+permissions: {}
+
+jobs:
+  fork-objects:
+    name: fork-objects
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' && startsWith(github.event.pull_request.head.ref, 'p0-v18')) ||
+      (github.event_name == 'pull_request' &&
+       (startsWith(github.event.pull_request.head.ref, 'p0-v18') || startsWith(github.event.pull_request.head.ref, 'phase0-')) &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_PR: ${{ github.event.pull_request.number }}
+      INPUT_PR: ${{ inputs.pr_number }}
+      MAX_BLOBS: ${{ inputs.max_blobs || '2000' }}
+    steps:
+      - name: Read fork head objects through the base repo
+        run: |
+          set -uo pipefail
+          [[ "$MAX_BLOBS" =~ ^[0-9]{1,5}$ ]] || MAX_BLOBS=2000
+          targets=()
+          [ "$EVENT_NAME" = "pull_request_target" ] && targets+=("$EVENT_PR")
+          if [[ "$INPUT_PR" =~ ^[0-9]+$ ]]; then targets+=("$INPUT_PR"); fi
+          while read -r n; do targets+=("$n"); done < <(gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
+            --jq ".[] | select(.head.repo.full_name != \"$REPO\") | .number")
+          # Numbers only: an empty list must stay empty (printf of no args prints one empty line).
+          mapfile -t targets < <(printf '%s\n' "${targets[@]}" | grep -E '^[0-9]+$' | sort -un)
+
+          # get URL: one GET with response headers. Sets G_STATUS (HTTP status, "000" when gh
+          # printed no status line) and G_BODY. No pipe into head or grep -q: under pipefail the
+          # early exit of the reader would kill gh with SIGPIPE (exit 141) and fail the step.
+          # --jq is never used, so a refused read cannot put its error body where a value belongs.
+          get() {
+            local out first
+            out=$(gh api -i "$1" 2>/dev/null) || true
+            first=${out%%$'\n'*}
+            first=${first%$'\r'}
+            G_STATUS=${first#* }; G_STATUS=${G_STATUS%% *}
+            [[ "$G_STATUS" =~ ^[0-9]{3}$ ]] || G_STATUS=000
+            if [[ "$out" == *$'\r\n\r\n'* ]]; then G_BODY=${out#*$'\r\n\r\n'}; else G_BODY=""; fi
+          }
+          all='[]'
+          for n in "${targets[@]}"; do
+            get "repos/$REPO/pulls/$n"
+            pr=$(jq -c '{number, head_sha: .head.sha, head_repo: .head.repo.full_name, base_sha: .base.sha}' <<<"$G_BODY" 2>/dev/null || echo '{}')
+            head=$(jq -r '.head_sha // ""' <<<"$pr" 2>/dev/null); base=$(jq -r '.base_sha // ""' <<<"$pr" 2>/dev/null)
+            if [ "$G_STATUS" != "200" ] || ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+              all=$(jq -c --arg n "$n" --arg s "$G_STATUS" '. + [{number:($n | tonumber), error:"PR read failed", pr_http:$s, commit_http:"n/a", refused:true, complete:false, pass:false}]' <<<"$all")
+              continue
+            fi
+            get "repos/$REPO/git/commits/$head"
+            commit_status=$G_STATUS
+            tree=""
+            [ "$commit_status" = "200" ] && tree=$(jq -r '.tree.sha // ""' <<<"$G_BODY" 2>/dev/null)
+            if [ "$commit_status" != "200" ] || ! [[ "$tree" =~ ^[0-9a-f]{40}$ ]]; then
+              # A refused or malformed commit read is an explicit FAIL row carrying the HTTP status.
+              all=$(jq -c --argjson pr "$pr" --arg s "$commit_status" '. + [$pr + {error:("commit read refused (HTTP " + $s + ")"), commit_http:$s, refused:true, complete:false, pass:false}]' <<<"$all")
+              continue
+            fi
+            get "repos/$REPO/git/trees/$tree?recursive=1"
+            tree_status=$G_STATUS
+            tree_json=$G_BODY
+            [ "$tree_status" = "200" ] || tree_json='{}'
+            # A valid tree response has the requested sha and a tree array.
+            tree_valid=$(jq --arg t "$tree" '(.sha == $t) and ((.tree | type) == "array")' <<<"$tree_json" 2>/dev/null || echo false)
+            # Keep a real false: `.truncated // "unknown"` would turn false into "unknown".
+            truncated=$(jq -r 'if has("truncated") then (.truncated | tostring) else "unknown" end' <<<"$tree_json" 2>/dev/null || echo unknown)
+            entries=$(jq '.tree // [] | length' <<<"$tree_json" 2>/dev/null || echo 0)
+            mapfile -t blobs < <(jq -r '.tree // [] | .[] | select(.type == "blob") | .sha' <<<"$tree_json" 2>/dev/null | sort -u)
+            total=${#blobs[@]}
+            ok=0; bad=0; checked=0; bad_list='[]'
+            for b in "${blobs[@]}"; do
+              [ "$checked" -lt "$MAX_BLOBS" ] || break
+              checked=$((checked+1))
+              get "repos/$REPO/git/blobs/$b"
+              s=$G_STATUS
+              if [ "$s" = "200" ]; then ok=$((ok+1)); else bad=$((bad+1)); bad_list=$(jq -c --arg b "$b" --arg s "$s" '. + [{blob:$b, http:$s}]' <<<"$bad_list"); fi
+            done
+            get "repos/$REPO/compare/$base...$head"
+            mb=""
+            [ "$G_STATUS" = "200" ] && mb=$(jq -r '.merge_base_commit.sha // ""' <<<"$G_BODY" 2>/dev/null)
+            mb_tree_status=""
+            if [ -n "$mb" ]; then
+              get "repos/$REPO/git/commits/$mb"
+              mbt=""
+              [ "$G_STATUS" = "200" ] && mbt=$(jq -r '.tree.sha // ""' <<<"$G_BODY" 2>/dev/null)
+              get "repos/$REPO/git/trees/$mbt?recursive=1"
+              mb_tree_status=$G_STATUS
+            fi
+            row=$(jq -n --argjson pr "$pr" --arg cs "$commit_status" --arg tree "$tree" --argjson tv "$tree_valid" \
+              --arg tr "$truncated" --arg ts "$tree_status" --argjson entries "$entries" --argjson total "$total" --argjson checked "$checked" \
+              --argjson ok "$ok" --argjson bad "$bad" --argjson bl "$bad_list" --arg mb "$mb" --arg mbs "$mb_tree_status" \
+              '$pr + {commit_http:$cs, tree_sha:$tree, tree_http:$ts, tree_valid:$tv, tree_truncated:$tr, tree_entries:$entries,
+                      blobs_total:$total, blobs_checked:$checked, blobs_ok:$ok, blobs_failed:$bad, failed:$bl,
+                      merge_base:$mb, merge_base_tree_http:$mbs,
+                      complete:($tv and $tr == "false" and $total > 0 and $checked == $total),
+                      pass:($cs == "200" and $tv and $tr == "false" and $total > 0 and $checked == $total
+                            and $ok == $total and $bad == 0)}')
+            all=$(jq -c --argjson r "$row" '. + [$r]' <<<"$all")
+          done
+          # result: PASS (every row passes), FAIL (a complete row has a failed read), INCOMPLETE (no
+          # targets, or a row could not check every blob: cap hit, bad or truncated tree).
+          summary=$(jq -n --arg ev "$EVENT_NAME" --argjson rows "$all" '
+            {event:$ev, targets:($rows | length), rows:$rows,
+             result:(if ($rows | length) == 0 then "INCOMPLETE"
+                     elif all($rows[]; .pass) then "PASS"
+                     elif any($rows[]; .complete and (.pass | not)) or any($rows[]; .refused == true) or any($rows[]; .commit_http | test("^[45]")) then "FAIL"
+                     else "INCOMPLETE" end)}')
+          {
+            echo "### V18 fork head objects through the base repo git API"
+            echo "PASS only when every target row has pass: true (all unique blobs checked and 200, tree valid and not truncated)."
+            echo '```json'
+            echo "$summary"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          result=$(jq -r .result <<<"$summary")
+          echo "V18 result: $result"
+          [ "$result" = "PASS" ]
