@@ -1,0 +1,31 @@
+name: t4-jobcheck
+
+# T4: can a JOB check (not a REST-created check run) be the required merge gate
+# on a fork PR? The job name below is the exact name the ruleset requires.
+# Result comes from the repo variable OC_GATE ("failure" fails, anything else passes).
+#
+# No checkout, no third-party actions, no token, no PR text in scripts.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  oc-claude-review-scn:
+    name: oc-claude-review-scn
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      GATE: ${{ vars.OC_GATE }}
+    steps:
+      - name: Gate
+        run: |
+          echo "OC_GATE=$GATE"
+          if [ "$GATE" = "failure" ]; then
+            echo "gate: failing on purpose"
+            exit 1
+          fi
+          echo "gate: success"
