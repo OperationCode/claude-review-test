@@ -17,7 +17,7 @@ on:
         description: "a = older success + newer in_progress; b = older failure + newer success; c = older success completed AFTER newer failure; f = older cancelled + newer success; g = same check re-completed"
         required: true
         type: choice
-        options: [a, b, c, f, g]
+        options: [a, b, c, f, g, set_success, set_failure, set_in_progress, set_cancelled, snapshot_only]
       head_sha:
         description: "Full 40-char head SHA of the PR (use a fresh commit for each scenario)"
         required: true
@@ -25,6 +25,11 @@ on:
       pr_number:
         description: "PR number"
         required: true
+        type: string
+      target_id:
+        description: "set_* scenarios: ID of an existing check run to rewrite"
+        required: false
+        default: ""
         type: string
       check_name:
         description: "Check name; must match the name the ruleset requires"
@@ -50,6 +55,7 @@ jobs:
       HEAD_SHA: ${{ inputs.head_sha }}
       PR_NUMBER: ${{ inputs.pr_number }}
       CHECK_NAME: ${{ inputs.check_name }}
+      TARGET_ID: ${{ inputs.target_id }}
     steps:
       - name: Run scenario
         run: |
@@ -119,7 +125,7 @@ jobs:
                       state
                       contexts(first:100) { nodes {
                         __typename
-                        ... on CheckRun { databaseId name status conclusion isRequired(pullRequestNumber:$n) }
+                        ... on CheckRun { databaseId name status conclusion isRequired(pullRequestNumber:$n) checkSuite { databaseId } }
                       } }
                     } } } }
                   }
@@ -162,6 +168,22 @@ jobs:
               snapshot "success re-completed as cancelled"
               finish "$A" success third
               snapshot "cancelled re-completed as success"
+              ;;
+            set_success|set_failure|set_in_progress|set_cancelled)
+              [[ "$TARGET_ID" =~ ^[0-9]+$ ]] || { echo "target_id must be digits"; exit 1; }
+              case "$SCENARIO" in
+                set_in_progress)
+                  gh api -X PATCH "repos/$REPO/check-runs/$TARGET_ID" -f status=in_progress >/dev/null
+                  ev --argjson id "$TARGET_ID" '{step:"set", id:$id, status:"in_progress"}'
+                  ;;
+                *)
+                  finish "$TARGET_ID" "${SCENARIO#set_}" set
+                  ;;
+              esac
+              snapshot "after $SCENARIO on $TARGET_ID"
+              ;;
+            snapshot_only)
+              snapshot "snapshot only"
               ;;
             *)
               echo "unknown scenario"; exit 1
