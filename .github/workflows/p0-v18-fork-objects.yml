@@ -66,20 +66,41 @@ jobs:
           # Numbers only: an empty list must stay empty (printf of no args prints one empty line).
           mapfile -t targets < <(printf '%s\n' "${targets[@]}" | grep -E '^[0-9]+$' | sort -un)
 
-          status() {  # prints the HTTP status of a GET
-            gh api -i "$1" 2>/dev/null | head -n 1 | awk '{print $2}'
+          # get URL: one GET with response headers. Sets G_STATUS (HTTP status, "000" when gh
+          # printed no status line) and G_BODY. No pipe into head or grep -q: under pipefail the
+          # early exit of the reader would kill gh with SIGPIPE (exit 141) and fail the step.
+          # --jq is never used, so a refused read cannot put its error body where a value belongs.
+          get() {
+            local out first
+            out=$(gh api -i "$1" 2>/dev/null) || true
+            first=${out%%$'\n'*}
+            first=${first%$'\r'}
+            G_STATUS=${first#* }; G_STATUS=${G_STATUS%% *}
+            [[ "$G_STATUS" =~ ^[0-9]{3}$ ]] || G_STATUS=000
+            if [[ "$out" == *$'\r\n\r\n'* ]]; then G_BODY=${out#*$'\r\n\r\n'}; else G_BODY=""; fi
           }
           all='[]'
           for n in "${targets[@]}"; do
-            pr=$(gh api "repos/$REPO/pulls/$n" --jq '{number, head_sha: .head.sha, head_repo: .head.repo.full_name, base_sha: .base.sha}')
-            head=$(jq -r .head_sha <<<"$pr" 2>/dev/null); base=$(jq -r .base_sha <<<"$pr" 2>/dev/null)
-            if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
-              all=$(jq -c --arg n "$n" '. + [{number:($n | tonumber), error:"PR read failed", commit_http:"n/a", complete:false, pass:false}]' <<<"$all")
+            get "repos/$REPO/pulls/$n"
+            pr=$(jq -c '{number, head_sha: .head.sha, head_repo: .head.repo.full_name, base_sha: .base.sha}' <<<"$G_BODY" 2>/dev/null || echo '{}')
+            head=$(jq -r '.head_sha // ""' <<<"$pr" 2>/dev/null); base=$(jq -r '.base_sha // ""' <<<"$pr" 2>/dev/null)
+            if [ "$G_STATUS" != "200" ] || ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+              all=$(jq -c --arg n "$n" --arg s "$G_STATUS" '. + [{number:($n | tonumber), error:"PR read failed", pr_http:$s, commit_http:"n/a", refused:true, complete:false, pass:false}]' <<<"$all")
               continue
             fi
-            commit_status=$(status "repos/$REPO/git/commits/$head")
-            tree=$(gh api "repos/$REPO/git/commits/$head" --jq .tree.sha 2>/dev/null || echo "")
-            tree_json=$(gh api "repos/$REPO/git/trees/$tree?recursive=1" 2>/dev/null || echo '{}')
+            get "repos/$REPO/git/commits/$head"
+            commit_status=$G_STATUS
+            tree=""
+            [ "$commit_status" = "200" ] && tree=$(jq -r '.tree.sha // ""' <<<"$G_BODY" 2>/dev/null)
+            if [ "$commit_status" != "200" ] || ! [[ "$tree" =~ ^[0-9a-f]{40}$ ]]; then
+              # A refused or malformed commit read is an explicit FAIL row carrying the HTTP status.
+              all=$(jq -c --argjson pr "$pr" --arg s "$commit_status" '. + [$pr + {error:("commit read refused (HTTP " + $s + ")"), commit_http:$s, refused:true, complete:false, pass:false}]' <<<"$all")
+              continue
+            fi
+            get "repos/$REPO/git/trees/$tree?recursive=1"
+            tree_status=$G_STATUS
+            tree_json=$G_BODY
+            [ "$tree_status" = "200" ] || tree_json='{}'
             # A valid tree response has the requested sha and a tree array.
             tree_valid=$(jq --arg t "$tree" '(.sha == $t) and ((.tree | type) == "array")' <<<"$tree_json" 2>/dev/null || echo false)
             # Keep a real false: `.truncated // "unknown"` would turn false into "unknown".
@@ -91,19 +112,25 @@ jobs:
             for b in "${blobs[@]}"; do
               [ "$checked" -lt "$MAX_BLOBS" ] || break
               checked=$((checked+1))
-              s=$(status "repos/$REPO/git/blobs/$b")
+              get "repos/$REPO/git/blobs/$b"
+              s=$G_STATUS
               if [ "$s" = "200" ]; then ok=$((ok+1)); else bad=$((bad+1)); bad_list=$(jq -c --arg b "$b" --arg s "$s" '. + [{blob:$b, http:$s}]' <<<"$bad_list"); fi
             done
-            mb=$(gh api "repos/$REPO/compare/$base...$head" --jq .merge_base_commit.sha 2>/dev/null || echo "")
+            get "repos/$REPO/compare/$base...$head"
+            mb=""
+            [ "$G_STATUS" = "200" ] && mb=$(jq -r '.merge_base_commit.sha // ""' <<<"$G_BODY" 2>/dev/null)
             mb_tree_status=""
             if [ -n "$mb" ]; then
-              mbt=$(gh api "repos/$REPO/git/commits/$mb" --jq .tree.sha 2>/dev/null || echo "")
-              mb_tree_status=$(status "repos/$REPO/git/trees/$mbt?recursive=1")
+              get "repos/$REPO/git/commits/$mb"
+              mbt=""
+              [ "$G_STATUS" = "200" ] && mbt=$(jq -r '.tree.sha // ""' <<<"$G_BODY" 2>/dev/null)
+              get "repos/$REPO/git/trees/$mbt?recursive=1"
+              mb_tree_status=$G_STATUS
             fi
             row=$(jq -n --argjson pr "$pr" --arg cs "$commit_status" --arg tree "$tree" --argjson tv "$tree_valid" \
-              --arg tr "$truncated" --argjson entries "$entries" --argjson total "$total" --argjson checked "$checked" \
+              --arg tr "$truncated" --arg ts "$tree_status" --argjson entries "$entries" --argjson total "$total" --argjson checked "$checked" \
               --argjson ok "$ok" --argjson bad "$bad" --argjson bl "$bad_list" --arg mb "$mb" --arg mbs "$mb_tree_status" \
-              '$pr + {commit_http:$cs, tree_sha:$tree, tree_valid:$tv, tree_truncated:$tr, tree_entries:$entries,
+              '$pr + {commit_http:$cs, tree_sha:$tree, tree_http:$ts, tree_valid:$tv, tree_truncated:$tr, tree_entries:$entries,
                       blobs_total:$total, blobs_checked:$checked, blobs_ok:$ok, blobs_failed:$bad, failed:$bl,
                       merge_base:$mb, merge_base_tree_http:$mbs,
                       complete:($tv and $tr == "false" and $total > 0 and $checked == $total),
@@ -117,7 +144,7 @@ jobs:
             {event:$ev, targets:($rows | length), rows:$rows,
              result:(if ($rows | length) == 0 then "INCOMPLETE"
                      elif all($rows[]; .pass) then "PASS"
-                     elif any($rows[]; .complete and (.pass | not)) or any($rows[]; .commit_http | test("^[45]")) then "FAIL"
+                     elif any($rows[]; .complete and (.pass | not)) or any($rows[]; .refused == true) or any($rows[]; .commit_http | test("^[45]")) then "FAIL"
                      else "INCOMPLETE" end)}')
           {
             echo "### V18 fork head objects through the base repo git API"
