@@ -1,12 +1,17 @@
 name: t5-required
 
 # T5 FIXTURE for Q4, not active in this repo. On a PR branch, copy it OVER
-# .github/workflows/t5-required.yml (same path as the required workflow).
-# It drops the failing branch: it always passes. Q4: does the ruleset still run
-# the version at the ruleset ref/sha, and does the PR copy count as the gate?
+# .github/workflows/t5-required.yml (same path, same workflow name, same job name
+# as the required workflow). It drops the failing branch: it always passes.
+# Trigger is pull_request on purpose: pull_request_target always runs the BASE
+# branch file, so the PR copy would never execute. With pull_request the PR copy
+# runs from the PR merge commit, like a real same-path attack.
+# Q4: does the ruleset still run the version at the ruleset ref/sha, and does this
+# PR copy (event pull_request) count as the gate? The summary prints the event and
+# workflow_ref so this run can be told apart from the base-branch runs.
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, reopened, synchronize]
 
 permissions: {}
@@ -19,7 +24,13 @@ jobs:
     permissions: {}
     env:
       WORKFLOW_VERSION: edited-by-pr
+      EVENT_NAME: ${{ github.event_name }}
+      WORKFLOW_REF: ${{ github.workflow_ref }}
     steps:
       - name: Edited gate
         run: |
-          echo "### t5-required EDITED BY PR (version: $WORKFLOW_VERSION), always passes" | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### t5-required EDITED BY PR (version: $WORKFLOW_VERSION), always passes"
+            echo "- event: $EVENT_NAME"
+            echo "- workflow_ref: $WORKFLOW_REF"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
