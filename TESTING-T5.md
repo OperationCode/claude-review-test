@@ -35,7 +35,7 @@ Scope: owner-made fork PRs do not exercise the outsider approval gate (`first_ti
 1. Fresh head SHA per row. Set the variables FIRST, then run `bump` (empty commit) or `swap` (changes the forged file), both push to the PR branch. Do not close and reopen: that keeps the old SHA and its old runs. Always `git add <path>`, never `-A`: the `results-T5*` files in the repo dir must not be committed.
 2. A row reads only runs of its own head SHA (`rd` below prints them).
 3. Wait until every check run of the head is `completed`, then call `rd` twice (it waits 10 seconds).
-4. A row is VALID only when `rd` shows the runs in its "Valid if" column. If not, mark the row invalid and rerun it (new `bump`). Never read the merge box of an invalid row.
+4. A row is VALID only when `rd` shows the runs in its "Valid if" column. If not, mark the row invalid and rerun it (new `bump`). Never read the merge box of an invalid row. After two invalid reruns of a row, stop and record the `rd` output (the check-runs line still shows each run).
 
 ```sh
 cd /Users/irving/src/operationcode/claude-review-test
@@ -48,11 +48,19 @@ swap() { git switch -q "$1" && cp "test-fixtures/$2" .github/workflows/t5-forger
 # rd <pr>   merge box + every check run and workflow run of the current head
 rd() { sleep 10; H=$(gh pr view "$1" --repo $R --json headRefOid --jq .headRefOid)
   echo "PR $1 head ${H:0:7}"; gh pr view "$1" --repo $R --json mergeStateStatus --jq .mergeStateStatus
-  gh api repos/$R/commits/$H/check-runs --jq '.check_runs[]|[.name,.status,.conclusion,.id]|@tsv'
+  gh api repos/$R/commits/$H/check-runs --jq '.check_runs[]|[.name,.status,.conclusion,.id,.started_at,.completed_at]|@tsv'
   gh api "repos/$R/actions/runs?head_sha=$H" --jq '.workflow_runs[]|[.path,.event,.status,.conclusion,.id]|@tsv'; }
 ```
 
-`mergeStateStatus` is the merge box: `CLEAN` can merge, `BLOCKED` a required rule is not met. Do not use `statusCheckRollup.state`. As org admin you see a bypass option on a BLOCKED PR. Do not use it. Read the real check names in the merge box and write them down (a required workflow can show a longer name).
+`mergeStateStatus` is the merge box. Read it as one of three states, and use only these words in every row:
+
+| `mergeStateStatus` | State | Meaning |
+|---|---|---|
+| `CLEAN`, `UNSTABLE`, `HAS_HOOKS` | Mergeable | no required rule blocks. `UNSTABLE` = a non-required check failed (for example the forged run, or another enabled workflow). |
+| `BLOCKED` | Blocked | a required rule is not met |
+| `UNKNOWN`, `BEHIND`, `DIRTY`, other | invalid | wait and call `rd` again (rule 4) |
+
+Do not use `statusCheckRollup.state`. As org admin you see a bypass option on a Blocked PR. Do not use it. Read the real check names in the merge box and write them down (a required workflow can show a longer name).
 
 ## Phase 0. Setup
 
@@ -80,11 +88,11 @@ gh api -X POST repos/$R/rulesets --input test-fixtures/ruleset/t5-repo-name-cont
 
 | # | Real `t5-gate` | Setup, then push to C and D | Valid if (`rd`, per head) | Expected | Meaning |
 |---|---|---|---|---|---|
-| K1 | absent (normal workflow disabled) | `bump` | one `t5-gate`: forged run, `success` | `CLEAN` | CONTROL: a forged pass satisfies a name rule |
+| K1 | absent (normal workflow disabled) | `bump` | one `t5-gate`: forged run, `success` | Mergeable | CONTROL: a forged pass satisfies a name rule |
 | K2 | fail | `gh workflow enable t5-required.yml --repo $R`, `T5_GATE=failure`, `bump` | two `t5-gate`: `t5-required.yml` (`pull_request_target`) `failure`, forged `success` | record only | not used in the decision |
-| K3 | absent | `gh workflow disable t5-required.yml --repo $R`, `T5_GATE=success`, `swap <branch> t5-forgery-fail.yml <remote>` | one `t5-gate`: forged run, `failure` | `BLOCKED` | CONTROL: a forged fail blocks a name rule |
+| K3 | absent | `gh workflow disable t5-required.yml --repo $R`, `T5_GATE=success`, `swap <branch> t5-forgery-fail.yml <remote>` | one `t5-gate`: forged run, `failure` | Blocked | CONTROL: a forged fail blocks a name rule |
 
-If K1 is `BLOCKED` or K3 is `CLEAN` (valid rows), the fixture does not work: stop and fix. Then: `gh api -X DELETE repos/$R/rulesets/$NR`. C and D keep the FAIL fixture for W3.
+If K1 is Blocked or K3 is Mergeable (valid rows), the fixture does not work: stop and fix. Then: `gh api -X DELETE repos/$R/rulesets/$NR`. C and D keep the FAIL fixture for W3.
 
 ## Phase W. Q1 and Q2 (b): org workflows rule
 
@@ -99,27 +107,34 @@ If the POST returns 422 or 403 on the `workflows` rule: stop, record the exact s
 
 | # | Required run | Setup, then push | PR | Valid if (`rd`, per head) | Expected | Meaning |
 |---|---|---|---|---|---|---|
-| W0 | pass | `T5_GATE=success`, `bump` | A | Required run `success`, no approval click | `CLEAN` | Q1 sanity. Record `gh api repos/$R/actions/runs/<id> --jq '{event,path,name}'` of the Required run. If no run starts, the ruleset run depends on the normal workflow: record, mark all W rows confounded. |
-| W0b | fail | `T5_GATE=failure`, `bump` | A | Required run `failure` | `BLOCKED` | Q1: the result gates the merge |
+| W0 | pass | `T5_GATE=success`, `bump` | A | Required run `success`, no approval click | Mergeable | Q1 sanity. Record `gh api repos/$R/actions/runs/<id> --jq '{event,path,name}'` of the Required run. If no run starts, the ruleset run depends on the normal workflow: record, mark all W rows confounded. |
+| W0b | fail | `T5_GATE=failure`, `bump` | A | Required run `failure` | Blocked | Q1: the result gates the merge |
 | W3 | pass, forged FAIL | `T5_GATE=success`, `bump` (fail fixture still in place from K3) | C, D | Required run `success` AND forged run `failure` | see Decision | Q2: does a forged fail block? |
 | W1 | fail, forged PASS | `T5_GATE=failure`, `swap <branch> t5-forgery.yml <remote>` | C, D | Required run `failure` AND forged run `success` | see Decision | Q2: does a forged pass satisfy? |
 | W2 | outsider fork | `T5_GATE=success`; close and reopen PR #4 (closing a third-party PR is intended; it is reopened at once) | #4 | none | record only | Q1 outsider: run starts? approval needed? |
 
-If W0 is not `CLEAN` or W0b is not `BLOCKED`, the workflows rule does not gate: stop, Q2 cannot be read.
+If W0 is not Mergeable or W0b is not Blocked, the workflows rule does not gate: stop, Q2 cannot be read.
 
 ## Decision (Q2)
 
 Only valid rows count (rule 4). PR D (fork) decides Q2. PR C (same repo) is recorded; if it differs from D, write it down as a separate finding.
 
-Preconditions: K1 `CLEAN`, K3 `BLOCKED`, W0 `CLEAN`, W0b `BLOCKED`. If one fails, fix and rerun that row; do not answer Q2 yet.
+Preconditions: K1 Mergeable, K3 Blocked, W0 Mergeable, W0b Blocked. If one fails, fix and rerun that row; do not answer Q2 yet.
 
 | W1 (D) | W3 (D) | Answer: does the workflows rule ignore the fork's same-name job? |
 |---|---|---|
-| `BLOCKED` | `CLEAN` | YES. A forged pass does not satisfy it and a forged fail does not block it. |
-| `CLEAN` | any | NO. A forged pass satisfies the rule. The reviewer gate cannot rely on it alone. |
-| any | `BLOCKED` | NO. The forged job counts for the rule (the Required run passed, and no other rule is active). |
+| Blocked | Mergeable | YES (only if the order check below passes). A forged pass does not satisfy it and a forged fail does not block it. |
+| Mergeable | any | NO. A forged pass satisfies the rule. The reviewer gate cannot rely on it alone. |
+| any | Blocked | NO. The forged job counts for the rule (the Required run passed, and no other rule is active). |
 
 All four outcomes give YES or NO. The rows cannot be confused: W1 and W3 have only one failed run each, and K3 proves the forged run is visible to a rule.
+
+Order check (YES only). A rule that matches the check name and takes the run that finished last (or first) can also give Blocked / Mergeable. To exclude this, compare `completed_at` of the two `t5-gate` check runs in the `rd` output of PR D:
+
+- W1: the forged run (`sleep 60`) completed AFTER the Required run.
+- W3: the forged run (fail fixture, no sleep) completed BEFORE the Required run.
+
+If both are true, YES is valid: an order-based name match gives NO in this order. If not, rerun that row (new `bump`, rule 4). If the order still does not hold, record the result as "YES, assumes no order-based name match".
 
 ## Phase B. Q3 (reusable workflow)
 
@@ -127,8 +142,8 @@ Normal runs of both files stay disabled (0.7), so only the ruleset runs exist.
 
 | # | Setup, then `bump` A | Expected |
 |---|---|---|
-| B1 | `gh api -X PUT orgs/OperationCode/rulesets/$RS --input test-fixtures/ruleset/t5-org-ruleset-phaseB.json` (200, 2 workflows). `T5_GATE=success`, `T5_CALL_GATE=success` | the Required run `t5-call` starts and calls `t5-callee`. `CLEAN`. Summary: `input pr_number` and the event PR number both equal A. Write down `workflow_ref`. |
-| B2 | `T5_CALL_GATE=failure` | `BLOCKED` by the call alone (T5_GATE is success) |
+| B1 | `gh api -X PUT orgs/OperationCode/rulesets/$RS --input test-fixtures/ruleset/t5-org-ruleset-phaseB.json` (200, 2 workflows). `T5_GATE=success`, `T5_CALL_GATE=success` | the Required run `t5-call` starts and calls `t5-callee`. Mergeable. Summary: `input pr_number` and the event PR number both equal A. Write down `workflow_ref`. |
+| B2 | `T5_CALL_GATE=failure` | Blocked by the call alone (T5_GATE is success) |
 
 Q3 is YES when B1 shows the number and B2 blocks. If no run starts, a required workflow cannot use `workflow_call` here; the design must be self-contained. Then `T5_CALL_GATE=success`.
 
@@ -136,11 +151,11 @@ Q3 is YES when B1 shows the number and B2 blocks. If no run starts, a required w
 
 | # | Action | Expected |
 |---|--------|----------|
-| C1 | In `test-fixtures/ruleset/t5-org-ruleset-phaseC-sha.json` replace `REPLACE_WITH_40_CHAR_COMMIT_SHA` with `$S1`, then `PUT orgs/OperationCode/rulesets/$RS --input` that file. `T5_GATE=success`. `bump` A. | HTTP 200, response echoes `sha`. If 422 on `sha` alone: record the text, retry with `"ref": "refs/heads/main"` added. Run summary: `workflow_sha` = `$S1`, `version: v1`. |
+| C1 | In `test-fixtures/ruleset/t5-org-ruleset-phaseC-sha.json` replace `REPLACE_WITH_40_CHAR_COMMIT_SHA` with `$S1` (working tree only, do not commit it), then `PUT orgs/OperationCode/rulesets/$RS --input` that file. `T5_GATE=success`. `bump` A. | HTTP 200, response echoes `sha`. If 422 on `sha` alone: record the text, retry with `"ref": "refs/heads/main"` added. Run summary: `workflow_sha` = `$S1`, `version: v1`. |
 | C2 | PR "t5-v2": branch from `main`, change `v1` to `v2` in `.github/workflows/t5-required.yml`, merge it (the pinned v1 run must pass). `bump` A. | the ruleset run still shows `v1`, `workflow_sha` = `$S1`. The pin holds. |
-| C3 | `PUT` the original `t5-org-ruleset.json` back. `T5_GATE=success`. `gh workflow enable t5-required.yml --repo $R` (else the PR copy cannot run). PR E: `git switch -c t5-edit main; cp test-fixtures/t5-forgery-edit.yml .github/workflows/t5-required.yml; git add .github/workflows/t5-required.yml && git commit -m "t5 edit"`, push, open PR. After `rd`: `gh workflow disable t5-required.yml --repo $R`. | Valid if three `t5-required.yml` runs: PR copy (`pull_request`, summary `edited-by-pr`) `failure`; normal base run (`pull_request_target`) `success`; Required run (event as in W0) `success`. `CLEAN`: the PR copy does not affect the rule. `BLOCKED`: the PR copy counts (finding; the only failed run is the PR copy). |
+| C3 | `PUT` the original `t5-org-ruleset.json` back. `T5_GATE=success`. `gh workflow enable t5-required.yml --repo $R` (else the PR copy cannot run). PR E: `git switch -c t5-edit main; cp test-fixtures/t5-forgery-edit.yml .github/workflows/t5-required.yml; git add .github/workflows/t5-required.yml && git commit -m "t5 edit"`, push, open PR. After `rd`: `gh workflow disable t5-required.yml --repo $R`. | Valid if three `t5-required.yml` runs: PR copy (`pull_request`, summary `edited-by-pr`) `failure`; normal base run (`pull_request_target`) `success`; Required run (event as in W0) `success`. Mergeable (expect `UNSTABLE`, the PR copy failed): the PR copy does not affect the rule. Blocked: the PR copy counts (finding; the only failed run is the PR copy). |
 
-Q4 pin is YES when C1 is 200 and C2 shows `v1`. Q4 edit is YES (ignored) when C3 is `CLEAN`.
+Q4 pin is YES when C1 is 200 and C2 shows `v1`. Q4 edit is YES (ignored) when C3 is Mergeable.
 
 ## Evidence
 

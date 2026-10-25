@@ -20,5 +20,7 @@ jobs:
     permissions: {}
     steps:
       - name: Forged pass
+        # sleep 60: this run must finish AFTER the Required run (Decision ordering check).
         run: |
+          sleep 60
           echo "### t5-forgery: forged t5-gate, always passes" | tee -a "$GITHUB_STEP_SUMMARY"
