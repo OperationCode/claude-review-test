@@ -4,7 +4,7 @@
   "enforcement": "active",
   "bypass_actors": [],
   "conditions": {
-    "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] },
+    "ref_name": { "include": ["refs/heads/p0-base"], "exclude": [] },
     "repository_id": { "repository_ids": [1432457406] }
   },
   "rules": [

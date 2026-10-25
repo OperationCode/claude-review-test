@@ -10,7 +10,7 @@ name: p0-v24-run-list
 #
 # Triggers:
 #   pull_request_target  head branch starts with p0-v24 (fork and same-repo PRs)
-#   pull_request         same-repo p0- or phase0- branches (runs before this file is merged)
+#   pull_request         same-repo p0-v24* or phase0-* branches (not the V6 PRs) (runs before this file is merged)
 #   workflow_dispatch    any head SHA (for example a V6 PR head)
 #
 # No checkout, no third-party actions, no secrets, no PR text in scripts.
@@ -39,7 +39,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' && startsWith(github.event.pull_request.head.ref, 'p0-v24')) ||
       (github.event_name == 'pull_request' &&
-       (startsWith(github.event.pull_request.head.ref, 'p0-') || startsWith(github.event.pull_request.head.ref, 'phase0-')) &&
+       (startsWith(github.event.pull_request.head.ref, 'p0-v24') || startsWith(github.event.pull_request.head.ref, 'phase0-')) &&
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -64,20 +64,31 @@ jobs:
           [[ "$MINUTES" =~ ^[0-9]{1,2}$ ]] && [ "$MINUTES" -ge 1 ] && [ "$MINUTES" -le 20 ] || MINUTES=6
           {
             echo "### V24 run list for head $head (event $EVENT_NAME, head repo ${HEAD_REPO:-n/a}, own run $RUN_ID)"
-            echo "first_seen - created_at = list delay (upper bound; poll every 3 s)"
+            echo "Times are epoch seconds. A new run was absent from the previous response (request sent at prev_req)"
+            echo "and present in this one (response received at resp). List delay D: delay_min_s <= D <= delay_max_s,"
+            echo "where delay_max_s = resp - created_at and delay_min_s = max(0, prev_req - created_at)."
+            echo "predates_poll: created before the first request; no delay is computed for it."
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          seen='[]'; errors=0
+          seen='[]'; errors=0; first_req=""; prev_req=""
           end=$(( $(date +%s) + MINUTES * 60 ))
           while [ "$(date +%s)" -lt "$end" ]; do
-            t=$(date -u +%FT%TZ)
+            req=$(date +%s)
             if ! cur=$(gh api "repos/$REPO/actions/runs?head_sha=$head&per_page=100" --jq '[.workflow_runs[] | {id, run_attempt, name, path, event, workflow_id, status, conclusion, created_at}]' 2>&1); then
-              errors=$((errors+1)); echo "$t list error: $cur" | tee -a "$GITHUB_STEP_SUMMARY"; sleep 3; continue
+              errors=$((errors+1)); echo "$(date -u +%FT%TZ) list error: $cur" | tee -a "$GITHUB_STEP_SUMMARY"; sleep 3; continue
             fi
-            jq -c --argjson seen "$seen" --arg t "$t" '.[] | select(.id as $i | $seen | index($i) | not)
-              | {first_seen:$t, delay_s:(($t | fromdateiso8601) - (.created_at | fromdateiso8601))} + .' <<<"$cur" \
+            resp=$(date +%s)
+            [ -n "$first_req" ] || first_req=$req
+            jq -c --argjson seen "$seen" --argjson req "$req" --argjson resp "$resp" --argjson first "$first_req" \
+              --arg prev "$prev_req" '.[] | select(.id as $i | $seen | index($i) | not)
+              | (.created_at | fromdateiso8601) as $c
+              | {req:$req, resp:$resp, prev_req:($prev | tonumber? // null), created:$c, predates_poll:($c < $first)}
+                + (if $c < $first or $prev == "" then {} else
+                   {delay_max_s:($resp - $c), delay_min_s:([0, (($prev | tonumber) - $c)] | max)} end)
+                + .' <<<"$cur" \
               | tee -a "$GITHUB_STEP_SUMMARY"
             seen=$(jq -c --argjson seen "$seen" '$seen + [.[].id] | unique' <<<"$cur")
+            prev_req=$req
             sleep 3
           done
           { echo "list errors: $errors"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"

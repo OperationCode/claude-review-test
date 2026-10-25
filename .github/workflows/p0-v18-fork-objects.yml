@@ -3,12 +3,13 @@ name: p0-v18-fork-objects
 # V18: can the base repo's GITHUB_TOKEN read a fork PR's head commit, tree and blobs
 # through the BASE repo's git API (repos/OperationCode/claude-review-test/git/...)?
 # Targets: the event PR (pull_request_target), the dispatch input PR, and every open
-# fork PR. Pass when every object read returns 200 and no tree is truncated.
+# fork PR. Pass when the tree is valid and not truncated and every unique blob in it
+# returns 200. The step exits nonzero unless the result is PASS (no targets = INCOMPLETE).
 #
 # Triggers:
 #   pull_request_target  PRs whose head branch starts with p0-v18 (the spec case)
 #   workflow_dispatch    any PR number (runs against existing fork PRs, no fork push)
-#   pull_request         same-repo PRs from p0- or phase0- branches: runs from the PR's own copy,
+#   pull_request         same-repo PRs from p0-v18* or phase0-* branches (not the V6 PRs): runs from the PR's own copy,
 #                        so it can run before this file is merged
 #
 # No checkout, no third-party actions, no secrets, no PR text in scripts.
@@ -25,9 +26,9 @@ on:
         required: false
         default: ""
       max_blobs:
-        description: "Blob reads per PR (cap)"
+        description: "Blob reads per PR (cap; a PR with more unique blobs is INCOMPLETE, not a pass)"
         required: false
-        default: "200"
+        default: "2000"
 
 permissions: {}
 
@@ -38,7 +39,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' && startsWith(github.event.pull_request.head.ref, 'p0-v18')) ||
       (github.event_name == 'pull_request' &&
-       (startsWith(github.event.pull_request.head.ref, 'p0-') || startsWith(github.event.pull_request.head.ref, 'phase0-')) &&
+       (startsWith(github.event.pull_request.head.ref, 'p0-v18') || startsWith(github.event.pull_request.head.ref, 'phase0-')) &&
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -51,18 +52,19 @@ jobs:
       EVENT_NAME: ${{ github.event_name }}
       EVENT_PR: ${{ github.event.pull_request.number }}
       INPUT_PR: ${{ inputs.pr_number }}
-      MAX_BLOBS: ${{ inputs.max_blobs || '200' }}
+      MAX_BLOBS: ${{ inputs.max_blobs || '2000' }}
     steps:
       - name: Read fork head objects through the base repo
         run: |
           set -uo pipefail
-          [[ "$MAX_BLOBS" =~ ^[0-9]{1,4}$ ]] || MAX_BLOBS=200
+          [[ "$MAX_BLOBS" =~ ^[0-9]{1,5}$ ]] || MAX_BLOBS=2000
           targets=()
           [ "$EVENT_NAME" = "pull_request_target" ] && targets+=("$EVENT_PR")
           if [[ "$INPUT_PR" =~ ^[0-9]+$ ]]; then targets+=("$INPUT_PR"); fi
           while read -r n; do targets+=("$n"); done < <(gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
             --jq ".[] | select(.head.repo.full_name != \"$REPO\") | .number")
-          mapfile -t targets < <(printf '%s\n' "${targets[@]}" | sort -un)
+          # Numbers only: an empty list must stay empty (printf of no args prints one empty line).
+          mapfile -t targets < <(printf '%s\n' "${targets[@]}" | grep -E '^[0-9]+$' | sort -un)
 
           status() {  # prints the HTTP status of a GET
             gh api -i "$1" 2>/dev/null | head -n 1 | awk '{print $2}'
@@ -70,35 +72,60 @@ jobs:
           all='[]'
           for n in "${targets[@]}"; do
             pr=$(gh api "repos/$REPO/pulls/$n" --jq '{number, head_sha: .head.sha, head_repo: .head.repo.full_name, base_sha: .base.sha}')
-            head=$(jq -r .head_sha <<<"$pr"); base=$(jq -r .base_sha <<<"$pr")
+            head=$(jq -r .head_sha <<<"$pr" 2>/dev/null); base=$(jq -r .base_sha <<<"$pr" 2>/dev/null)
+            if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+              all=$(jq -c --arg n "$n" '. + [{number:($n | tonumber), error:"PR read failed", commit_http:"n/a", complete:false, pass:false}]' <<<"$all")
+              continue
+            fi
             commit_status=$(status "repos/$REPO/git/commits/$head")
             tree=$(gh api "repos/$REPO/git/commits/$head" --jq .tree.sha 2>/dev/null || echo "")
             tree_json=$(gh api "repos/$REPO/git/trees/$tree?recursive=1" 2>/dev/null || echo '{}')
-            truncated=$(jq -r '.truncated // "unknown"' <<<"$tree_json")
-            entries=$(jq '.tree // [] | length' <<<"$tree_json")
-            ok=0; bad=0; bad_list='[]'
-            while read -r b; do
+            # A valid tree response has the requested sha and a tree array.
+            tree_valid=$(jq --arg t "$tree" '(.sha == $t) and ((.tree | type) == "array")' <<<"$tree_json" 2>/dev/null || echo false)
+            # Keep a real false: `.truncated // "unknown"` would turn false into "unknown".
+            truncated=$(jq -r 'if has("truncated") then (.truncated | tostring) else "unknown" end' <<<"$tree_json" 2>/dev/null || echo unknown)
+            entries=$(jq '.tree // [] | length' <<<"$tree_json" 2>/dev/null || echo 0)
+            mapfile -t blobs < <(jq -r '.tree // [] | .[] | select(.type == "blob") | .sha' <<<"$tree_json" 2>/dev/null | sort -u)
+            total=${#blobs[@]}
+            ok=0; bad=0; checked=0; bad_list='[]'
+            for b in "${blobs[@]}"; do
+              [ "$checked" -lt "$MAX_BLOBS" ] || break
+              checked=$((checked+1))
               s=$(status "repos/$REPO/git/blobs/$b")
               if [ "$s" = "200" ]; then ok=$((ok+1)); else bad=$((bad+1)); bad_list=$(jq -c --arg b "$b" --arg s "$s" '. + [{blob:$b, http:$s}]' <<<"$bad_list"); fi
-            done < <(jq -r '.tree // [] | .[] | select(.type == "blob") | .sha' <<<"$tree_json" | head -n "$MAX_BLOBS")
+            done
             mb=$(gh api "repos/$REPO/compare/$base...$head" --jq .merge_base_commit.sha 2>/dev/null || echo "")
             mb_tree_status=""
             if [ -n "$mb" ]; then
               mbt=$(gh api "repos/$REPO/git/commits/$mb" --jq .tree.sha 2>/dev/null || echo "")
               mb_tree_status=$(status "repos/$REPO/git/trees/$mbt?recursive=1")
             fi
-            row=$(jq -n --argjson pr "$pr" --arg cs "$commit_status" --arg tree "$tree" --arg tr "$truncated" \
-              --argjson entries "$entries" --argjson ok "$ok" --argjson bad "$bad" --argjson bl "$bad_list" \
-              --arg mb "$mb" --arg mbs "$mb_tree_status" \
-              '$pr + {commit_http:$cs, tree_sha:$tree, tree_truncated:$tr, tree_entries:$entries, blobs_ok:$ok,
-                      blobs_failed:$bad, failed:$bl, merge_base:$mb, merge_base_tree_http:$mbs,
-                      pass:($cs == "200" and $tree != "" and $tr == "false" and $bad == 0 and $ok > 0)}')
+            row=$(jq -n --argjson pr "$pr" --arg cs "$commit_status" --arg tree "$tree" --argjson tv "$tree_valid" \
+              --arg tr "$truncated" --argjson entries "$entries" --argjson total "$total" --argjson checked "$checked" \
+              --argjson ok "$ok" --argjson bad "$bad" --argjson bl "$bad_list" --arg mb "$mb" --arg mbs "$mb_tree_status" \
+              '$pr + {commit_http:$cs, tree_sha:$tree, tree_valid:$tv, tree_truncated:$tr, tree_entries:$entries,
+                      blobs_total:$total, blobs_checked:$checked, blobs_ok:$ok, blobs_failed:$bad, failed:$bl,
+                      merge_base:$mb, merge_base_tree_http:$mbs,
+                      complete:($tv and $tr == "false" and $total > 0 and $checked == $total),
+                      pass:($cs == "200" and $tv and $tr == "false" and $total > 0 and $checked == $total
+                            and $ok == $total and $bad == 0)}')
             all=$(jq -c --argjson r "$row" '. + [$r]' <<<"$all")
           done
+          # result: PASS (every row passes), FAIL (a complete row has a failed read), INCOMPLETE (no
+          # targets, or a row could not check every blob: cap hit, bad or truncated tree).
+          summary=$(jq -n --arg ev "$EVENT_NAME" --argjson rows "$all" '
+            {event:$ev, targets:($rows | length), rows:$rows,
+             result:(if ($rows | length) == 0 then "INCOMPLETE"
+                     elif all($rows[]; .pass) then "PASS"
+                     elif any($rows[]; .complete and (.pass | not)) or any($rows[]; .commit_http | test("^[45]")) then "FAIL"
+                     else "INCOMPLETE" end)}')
           {
             echo "### V18 fork head objects through the base repo git API"
-            echo "Pass when every row has pass: true."
+            echo "PASS only when every target row has pass: true (all unique blobs checked and 200, tree valid and not truncated)."
             echo '```json'
-            jq -n --arg ev "$EVENT_NAME" --argjson rows "$all" '{event:$ev, rows:$rows, all_pass:($rows | length > 0 and all(.pass))}'
+            echo "$summary"
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+          result=$(jq -r .result <<<"$summary")
+          echo "V18 result: $result"
+          [ "$result" = "PASS" ]
