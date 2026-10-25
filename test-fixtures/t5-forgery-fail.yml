@@ -1,0 +1,25 @@
+name: t5-required
+
+# T5 FIXTURE, not active in this repo. Same as t5-forgery.yml, but the forged
+# job always FAILS. Copy it over .github/workflows/t5-forgery.yml on the PR branch.
+# Q2 rows K3/W3: a forged fail must block a plain name rule (K3) and must NOT
+# block the workflows rule when the required run passes (W3).
+# No checkout, no token, no secrets, no PR text in scripts.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  t5-gate:
+    name: t5-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Forged fail
+        run: |
+          echo "### t5-forgery-fail: forged t5-gate, always fails" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 1

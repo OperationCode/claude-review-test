@@ -2,7 +2,8 @@ name: t5-required
 
 # T5 FIXTURE for Q4, not active in this repo. On a PR branch, copy it OVER
 # .github/workflows/t5-required.yml (same path, same workflow name, same job name
-# as the required workflow). It drops the failing branch: it always passes.
+# as the required workflow). It always FAILS, so row C3 can tell whether the
+# PR copy changes the merge box while the required run passes.
 # Trigger is pull_request on purpose: pull_request_target always runs the BASE
 # branch file, so the PR copy would never execute. With pull_request the PR copy
 # runs from the PR merge commit, like a real same-path attack.
@@ -30,7 +31,8 @@ jobs:
       - name: Edited gate
         run: |
           {
-            echo "### t5-required EDITED BY PR (version: $WORKFLOW_VERSION), always passes"
+            echo "### t5-required EDITED BY PR (version: $WORKFLOW_VERSION), always fails"
             echo "- event: $EVENT_NAME"
             echo "- workflow_ref: $WORKFLOW_REF"
           } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 1
