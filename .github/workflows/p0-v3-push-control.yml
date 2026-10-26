@@ -1,0 +1,51 @@
+name: p0-v3-push-control
+
+# V3 negative control shaped like the Console sample workflow: a push-triggered
+# workflow in the TARGET repo mints an OIDC token (audience https://api.anthropic.com)
+# and tries the exchange against the TEST federation rule. Pass when rejected (HTTP 401):
+# event_name is push and job_workflow_ref is not the scratch p0-required.yml.
+# Prints the status and non-secret response fields only; never the OIDC token or an access token.
+# No checkout, no third-party actions, no secrets.
+
+on:
+  push:
+    branches: [p0-v3-base]
+
+permissions: {}
+
+env:
+  P0_FEDERATION_RULE_ID: "fdrl_01DrmQ8SP1yTeAi8icEtQbUD"
+  P0_ORGANIZATION_ID: "2bc920f9-977b-43b2-870a-f840e4ce809c"
+  P0_SERVICE_ACCOUNT_ID: "svac_017eR3ohB6rP5MEAsda6U7X6"
+  P0_WORKSPACE_ID: "wrkspc_01EqtFqUCBzVQSrRnWob8ZFK"
+
+jobs:
+  exchange:
+    name: exchange
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+    steps:
+      - name: Mint, decode, exchange
+        run: |
+          set -euo pipefail
+          resp=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://api.anthropic.com")
+          token=$(jq -r '.value // empty' <<<"$resp"); unset resp
+          [ -n "$token" ] || { echo "mint failed"; exit 1; }
+          python3 -c 'import sys,json,base64; p=sys.stdin.read().strip().split(".")[1]; p+="="*(-len(p)%4); c=json.loads(base64.urlsafe_b64decode(p)); print(json.dumps({k:c.get(k) for k in ("iss","aud","repository","repository_owner_id","event_name","job_workflow_ref","job_workflow_sha","sub")}, indent=1))' <<<"$token" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -z "$P0_FEDERATION_RULE_ID" ]; then echo "exchange skipped (IDs empty)"; exit 0; fi
+          body=$(jq -n --arg a "$token" --arg r "$P0_FEDERATION_RULE_ID" --arg o "$P0_ORGANIZATION_ID" \
+            --arg s "$P0_SERVICE_ACCOUNT_ID" --arg w "$P0_WORKSPACE_ID" \
+            '{grant_type:"urn:ietf:params:oauth:grant-type:jwt-bearer", assertion:$a, federation_rule_id:$r,
+              organization_id:$o, service_account_id:$s} + (if $w == "" then {} else {workspace_id:$w} end)')
+          unset token
+          out=$(mktemp); at=$(date -u +%FT%TZ)
+          code=$(curl -sS -o "$out" -w '%{http_code}' -X POST https://api.anthropic.com/v1/oauth/token \
+            -H 'content-type: application/json' --data-binary @- <<<"$body" || echo 000)
+          unset body
+          jq -n --arg at "$at" --arg code "$code" --argjson r "$(jq -c 'walk(if type == "object" then with_entries(select(.key | endswith("token") | not)) else . end)' "$out" 2>/dev/null || echo null)" \
+            '{v3_case:"push control", at:$at, exchange_http:$code, body:$r, v3_pass:($code == "401")}' | tee -a "$GITHUB_STEP_SUMMARY"
+          rm -f "$out"
