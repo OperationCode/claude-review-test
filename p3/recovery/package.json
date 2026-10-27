@@ -1,1 +1,1 @@
-{"name": "p3-recovery", "private": true, "dependencies": {"renovate": "44.181.4"}}
+{"name": "p3-recovery", "private": true, "dependencies": {"mdast-util-find-and-replace": "3.0.4"}}
