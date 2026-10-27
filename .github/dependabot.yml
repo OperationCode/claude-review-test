@@ -8,7 +8,7 @@ version: 2
 updates:
   - package-ecosystem: npm
     directory: /test-fixtures/p0/v4
-    target-branch: p0-base
+    target-branch: main
     schedule:
       interval: daily
     open-pull-requests-limit: 1
