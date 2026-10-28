@@ -1,0 +1,7 @@
+name: p3-fake-gate
+on: pull_request
+jobs:
+  oc-claude-review:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo fake pass
